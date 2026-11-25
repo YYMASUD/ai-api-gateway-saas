@@ -13,7 +13,7 @@ export default function ResetPage() {
   return (
     <AuthCard
       title="Reset your password"
-      description="We will email a single-use reset link if the address matches an account."
+      description="A single-use reset link will be emailed once Phase 5 ships email delivery."
       footer={<AuthFooterLink prompt="Remembered it?" href="/login" label="Back to sign in" />}
     >
       <form className="flex flex-col gap-4" aria-label="Password reset form">
@@ -27,11 +27,12 @@ export default function ResetPage() {
             type="email"
             autoComplete="email"
             required
+            disabled
             placeholder="you@example.com"
-            className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+            className="h-10 rounded-md border border-input bg-background px-3 text-sm opacity-60"
           />
         </div>
-        <Button type="submit" className="w-full">
+        <Button type="submit" className="w-full" disabled>
           Send reset link
         </Button>
         <AuthPlaceholderNotice />

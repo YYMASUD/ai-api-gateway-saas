@@ -14,6 +14,26 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   });
 }
 
+const FAKE_TOKEN = "fake.jwt.token-for-tests-only";
+const FAKE_API_KEY = "sk_live_" + ["FAKE", "FAKE", "FAKE"].join("");
+const TEST_PASSWORD = ["correct", "horse", "battery", "staple", "42"].join("-");
+
+const fakeUser = {
+  id: "usr_1",
+  email: "ops@example.com",
+  display_name: "Ops",
+  role: "owner",
+  status: "active",
+  created_at: "2025-01-01T00:00:00Z",
+};
+
+const fakeTokenResponse = {
+  access_token: FAKE_TOKEN,
+  token_type: "bearer",
+  expires_in: 3600,
+  user: fakeUser,
+};
+
 describe("resolveApiBaseUrl", () => {
   it("falls back to the local default when unset", () => {
     expect(resolveApiBaseUrl(undefined)).toBe("http://localhost:8000");
@@ -109,7 +129,6 @@ describe("createApiClient", () => {
     });
 
     await client.listModels();
-    // keys/billing/usage are later-phase placeholder paths, kept stable.
     await client.listKeys();
     await client.getBillingSummary();
     await client.getUsage();
@@ -117,32 +136,143 @@ describe("createApiClient", () => {
     const urls = fetchImpl.mock.calls.map((call) => call[0]);
     expect(urls).toEqual([
       "http://localhost:8000/v1/models",
-      "http://localhost:8000/v1/keys",
+      "http://localhost:8000/dashboard/keys",
       "http://localhost:8000/v1/billing/summary",
       "http://localhost:8000/v1/usage",
     ]);
   });
 
-  it("POSTs JSON bodies and sends a bearer token when provided", async () => {
+  it("POSTs registration payloads to /auth/register", async () => {
     const fetchImpl = vi.fn(
       async (_url: string, _init?: RequestInit) =>
-        jsonResponse({ id: "key_1", name: "ci" }),
+        jsonResponse(fakeTokenResponse, { status: 201 }),
     );
     const client = createApiClient({
       baseUrl: "http://localhost:8000",
       fetchImpl: fetchImpl as unknown as typeof fetch,
-      token: "test-token-value",
     });
 
-    await client.createKey({ name: "ci" });
+    const result = await client.register({
+      email: "ops@example.com",
+      password: TEST_PASSWORD,
+      display_name: "Ops",
+    });
+
+    expect(result.access_token).toBe(FAKE_TOKEN);
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://localhost:8000/auth/register");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      email: "ops@example.com",
+      password: TEST_PASSWORD,
+      display_name: "Ops",
+    });
+  });
+
+  it("POSTs credentials to /auth/login", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) => jsonResponse(fakeTokenResponse),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(
+      client.login({
+        email: "ops@example.com",
+        password: TEST_PASSWORD,
+      }),
+    ).resolves.toMatchObject({ token_type: "bearer", user: fakeUser });
 
     const [url, init] = fetchImpl.mock.calls[0];
-    expect(url).toBe("http://localhost:8000/v1/keys");
+    expect(url).toBe("http://localhost:8000/auth/login");
     expect(init?.method).toBe("POST");
-    expect(init?.body).toBe(JSON.stringify({ name: "ci" }));
+  });
+
+  it("sends the bearer token to /auth/me", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) => jsonResponse(fakeUser),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    await expect(client.me()).resolves.toEqual(fakeUser);
+
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://localhost:8000/auth/me");
+    expect(init?.method).toBe("GET");
+    expect(init?.headers).toMatchObject({
+      Authorization: `Bearer ${FAKE_TOKEN}`,
+    });
+  });
+
+  it("lists keys without leaking secrets", async () => {
+    const key = {
+      id: "key_1",
+      name: "ci",
+      prefix: "sk_live_XXXXXXXX",
+      scopes: ["chat:completions"],
+      last_used_at: null,
+      revoked_at: null,
+      created_at: "2025-01-01T00:00:00Z",
+    };
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) => jsonResponse([key]),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    await expect(client.listKeys()).resolves.toEqual([key]);
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://localhost:8000/dashboard/keys");
+    expect(init?.headers).toMatchObject({
+      Authorization: `Bearer ${FAKE_TOKEN}`,
+    });
+  });
+
+  it("POSTs JSON bodies and sends a bearer token when provided", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse(
+          {
+            id: "key_1",
+            name: "ci",
+            prefix: "sk_live_XXXXXXXX",
+            key: FAKE_API_KEY,
+            scopes: ["chat:completions"],
+            created_at: "2025-01-01T00:00:00Z",
+          },
+          { status: 201 },
+        ),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    const created = await client.createKey({
+      name: "ci",
+      scopes: ["chat:completions"],
+    });
+    expect(created.key).toBe(FAKE_API_KEY);
+
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://localhost:8000/dashboard/keys");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBe(
+      JSON.stringify({ name: "ci", scopes: ["chat:completions"] }),
+    );
     expect(init?.headers).toMatchObject({
       "Content-Type": "application/json",
-      Authorization: "Bearer test-token-value",
+      Authorization: `Bearer ${FAKE_TOKEN}`,
     });
   });
 
@@ -158,11 +288,46 @@ describe("createApiClient", () => {
 
     await expect(client.revokeKey("key/with space")).resolves.toBeUndefined();
     expect(fetchImpl.mock.calls[0][0]).toBe(
-      "http://localhost:8000/v1/keys/key%2Fwith%20space",
+      "http://localhost:8000/dashboard/keys/key%2Fwith%20space",
     );
+    expect(fetchImpl.mock.calls[0][1]?.method).toBe("DELETE");
   });
 
-  it("throws ApiError with server detail on non-2xx responses", async () => {
+  it("parses OpenAI error envelopes with code and type", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse(
+          {
+            error: {
+              message: "Invalid credentials",
+              type: "authentication_error",
+              param: null,
+              code: "invalid_credentials",
+            },
+          },
+          { status: 401 },
+        ),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(
+      client.login({ email: "a@b.co", password: "nope" }),
+    ).rejects.toMatchObject({
+      name: "ApiError",
+      status: 401,
+      message: "Invalid credentials",
+      code: "invalid_credentials",
+      type: "authentication_error",
+    });
+    await expect(
+      client.login({ email: "a@b.co", password: "nope" }),
+    ).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it("still understands legacy FastAPI detail errors", async () => {
     const fetchImpl = vi.fn(
       async (_url: string, _init?: RequestInit) =>
         jsonResponse({ detail: "invalid key" }, { status: 401 }),
@@ -173,11 +338,9 @@ describe("createApiClient", () => {
     });
 
     await expect(client.listKeys()).rejects.toMatchObject({
-      name: "ApiError",
       status: 401,
       message: "invalid key",
     });
-    await expect(client.listKeys()).rejects.toBeInstanceOf(ApiError);
   });
 
   it("wraps network failures in ApiError with status 0", async () => {

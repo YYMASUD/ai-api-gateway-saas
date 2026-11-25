@@ -2,9 +2,9 @@
 
 ## Scope and status
 
-Phase 1 establishes a local, production-shaped topology and security boundaries. Service code is mostly skeleton: health/readiness, configuration, persistence models, security helpers, and structured logging exist; user-facing key management, billing flows, model routing, and observability are later phases.
+Phase 1 establishes a local, production-shaped topology and security boundaries. Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Service code for health/readiness, configuration, persistence models, security helpers, structured logging, auth, and key management is implemented; inference routing, billing flows, and observability are later phases.
 
-This document describes the intended architecture and marks which parts are actually implemented in Phase 1.
+This document describes the intended architecture and marks which parts are actually implemented.
 
 ## Components
 
@@ -14,7 +14,7 @@ This document describes the intended architecture and marks which parts are actu
 | `api` | FastAPI / Python 3.12 | `127.0.0.1:8000` only | Public OpenAI-compatible gateway (planned), dashboard API (planned), health/readiness (implemented), auth/usage/billing orchestration. |
 | `worker` | ARQ / Python 3.12 | none | Private async jobs: usage rollup, credit settlement, webhook processing, reconciliation, email (stubs in Phase 1). |
 | `postgres` | PostgreSQL 16 | none | System of record for users, API keys, credits, usage, payments, webhooks, audit logs, and model pricing. |
-| `redis` | Redis 7 (AOF) | none | Queue backend for ARQ plus private cache/rate-limit state later. AOF persistence volume is enabled. |
+| `redis` | Redis 7 (AOF) | none | Queue backend for ARQ; Phase 2 also uses it for the 60s API-key lookup cache. Rate-limit state comes later. AOF persistence volume is enabled. |
 | `litellm` | LiteLLM proxy | none | Only outbound model gateway. Owns provider routing/fallbacks; master key required for management and proxy auth. |
 
 Network: a single Docker bridge network named `backend`. Only `web` and `api` publish ports. In production, TLS termination and ingress are added in front of `web`/`api`; Postgres, Redis, LiteLLM, and the worker remain private with no public listeners.
@@ -54,14 +54,14 @@ Rules enforced by configuration:
 ## Request flow (intended Phase 2+ inference)
 
 1. Client sends an OpenAI-compatible request to `POST /v1/chat/completions` with a gateway API key.
-2. FastAPI authenticates the key by hashing `raw_key + API_KEY_PEPPER` with SHA-256 and looking up `api_keys.key_hash` (helpers exist in Phase 1; the dependency is not wired yet).
+2. FastAPI authenticates the key by hashing `raw_key + API_KEY_PEPPER` with SHA-256 and looking up `api_keys.key_hash` (helpers and the 60s Redis lookup cache exist as of Phase 2; the `/v1` route wiring arrives in a later phase).
 3. FastAPI checks/reserves credits using the append-only `credit_ledger` and `credit_balances` tables. Money is integer **microcredits**: `1,000,000 microcredits = 1 credit`; no floats are stored.
 4. FastAPI calls LiteLLM over the private network with the master key, forwarding only the model alias and sanitized request fields.
 5. LiteLLM selects a configured provider deployment and calls the upstream provider. Provider credentials never leave LiteLLM.
 6. FastAPI records a `usage_events` row (idempotent on `request_id`), settles the reservation, and returns an OpenAI-compatible response/error.
 7. Background workers roll up usage, settle credits, process webhook events, and send email.
 
-As of Phase 1, steps 2-7 are contracts/TODOs. The implemented API surface is health/readiness only (see `docs/API.md`).
+As of Phase 2, step 2 (key authentication primitives and caching) is implemented; steps 3–7 and the `/v1` route wiring remain contracts/TODOs. The implemented API surface is health/readiness plus authentication and API-key lifecycle (see `docs/API.md`).
 
 ## Data model (Phase 1 schema)
 
@@ -75,7 +75,7 @@ The initial Alembic revision creates:
 - `payments`: provider payment/checkout references and amounts.
 - `webhook_events`: provider event id, payload, status, attempts, and errors.
 - `audit_logs`: actor/action/resource metadata.
-- `model_pricing`: active input/output prices per million tokens in microcredits.
+- `model_pricing`: active input/output prices per 1,000 tokens in microcredits.
 
 Database access is async SQLAlchemy 2.x with `asyncpg`. Alembic uses the same `DATABASE_URL` from settings.
 
@@ -114,6 +114,14 @@ Secrets manager injects env at runtime.
 ```
 
 Terraform will own networking, managed data services, runtime services, IAM, remote encrypted state, and secret-manager entries. The current `infra/terraform` files intentionally declare no resources.
+
+## Decisions in Phase 2
+
+- Argon2id for password hashing; 12–128 character password policy; generic invalid-credential 401 responses on login to prevent email enumeration.
+- HS256 JWTs pinned in code and config; required `exp`/`iss`/`aud`; short TTL via `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` (5–1440 minutes).
+- API keys are `sk_live_` + 32 random bytes; only `SHA-256(raw_key + API_KEY_PEPPER)` and the 8-character prefix are stored.
+- Redis is the API-key lookup cache with a 60s TTL; revocation deletes the cache entry immediately (stale-but-bounded on failure).
+- The dashboard stores the JWT in `sessionStorage` as an interim Phase 2 measure; production must migrate to HttpOnly cookies behind a BFF.
 
 ## Decisions in Phase 1
 

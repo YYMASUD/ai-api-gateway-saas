@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     jwt_issuer: str = "ai-api-gateway"
     jwt_audience: str = "ai-api-gateway-dashboard"
     jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = Field(default=60, ge=5, le=1440)
 
     # API key hashing
     api_key_pepper: str

@@ -31,8 +31,8 @@ export function AuthCard({
 export function AuthPlaceholderNotice() {
   return (
     <p className="rounded-md border border-dashed border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-      Authentication is not wired to a backend yet. Phase 1 ships the UI shell
-      only; submissions are handled in a later milestone.
+      Password reset is a later-phase placeholder. Email delivery ships in
+      Phase 5; this form is disabled and sends nothing today.
     </p>
   );
 }

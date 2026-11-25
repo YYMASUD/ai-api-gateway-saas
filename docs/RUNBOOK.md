@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-Phase 1 is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Later-phase tasks are marked TODO.
+The stack is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Phase 1 established the topology, health/readiness, and data layer; Phase 2 added email/password auth and API-key management. Later-phase tasks are marked TODO.
 
 ## Start and stop
 
@@ -38,6 +38,14 @@ Expected Phase 1 behavior:
 - LiteLLM starts with an empty model list in Phase 1; liveness exists, but inference routes are not configured.
 - Worker job stubs return `{"status":"noop", "job": ...}`; no credits move yet.
 
+Expected Phase 2 behavior:
+
+- `POST /auth/register` returns 201 with a `TokenResponse` envelope (`access_token`, `token_type`, `expires_in`, `user`). Re-registering the same email returns 409.
+- `POST /auth/login` returns 200 with the same envelope on success, or a generic 401 for any invalid-credential case (no enumeration of whether the email exists).
+- `GET /auth/me` returns 200 with the `UserResponse` for the JWT's `sub`; 401 for missing/expired/invalid tokens.
+- `GET /dashboard/keys` returns a bare JSON array of key metadata (no plaintext keys). `POST /dashboard/keys` returns the key exactly once in `CreatedApiKey.key`; `DELETE /dashboard/keys/{id}` returns 204 and invalidates the Redis cache entry.
+- JWT `expires_in` equals `JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60` (default 3600s). The web UI stores the token in `sessionStorage` (interim; see SECURITY.md).
+
 ## Common failures
 
 | Symptom | Cause | Action |
@@ -51,6 +59,27 @@ Expected Phase 1 behavior:
 | Web client health call 404 | `NEXT_PUBLIC_API_BASE_URL` points at the wrong origin | Set the public FastAPI origin before building; the client targets `/healthz`. |
 | Migration fails | Database unreachable or no revision applied | Wait for Postgres health, check `DATABASE_URL`, then run `make migrate`. |
 | Port conflict | Host 3000/8000 already used | Stop the conflicting process; Compose binds to `127.0.0.1` only. |
+
+## Phase 2 authentication and key troubleshooting
+
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| `POST /auth/register` returns 409 | Email already registered | Login instead, or register with a different address. There is no self-service password reset yet. |
+| `POST /auth/register` returns 422 | Email format, or password outside 12–128 chars | Fix the input; pydantic returns the field location in the error body. |
+| `POST /auth/login` returns 401 for a known account | Generic invalid-credential response (anti-enumeration) | Verify the password; if the user truly forgot, wait for the Phase 3 password-reset flow. Do not bypass by editing the DB directly. |
+| `GET /auth/me` returns 401 | Missing `Authorization` header, expired JWT, or wrong `iss`/`aud` | Re-login to obtain a fresh token. `expires_in` matches `JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60` (default 3600s). |
+| JWT accepted locally but rejected elsewhere | Different `JWT_ISSUER`/`JWT_AUDIENCE`/`JWT_SECRET` on the verifier | Ensure every service that validates tokens shares the same three values. HS256 is pinned; `JWT_ALGORITHM` rejects anything else. |
+| Change to `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` has no effect on existing sessions | TTL is enforced by the `exp` claim baked into issued tokens | Existing tokens keep their original expiry. New logins pick up the new TTL. Range is 5–1440 minutes. |
+| `/dashboard/keys*` returns 403 | Key ID exists but belongs to a different user | Owner-only enforcement is correct; do not weaken it. Use the owning account or an admin path (later phase). |
+| `POST /dashboard/keys` returns 422 | Blank/oversized name (>64 chars) or unknown scope | Use only `chat:completions` and/or `models:read`. |
+| Revoked key still authenticates for up to ~60s | Stale Redis lookup cache (bounded) | Confirm the `DELETE /dashboard/keys/{id}` returned 204 and that `api_keys.revoked_at` is set. Cache entries are deleted on revoke; if the delete failed, the key remains usable for at most the 60s TTL. Inference enforcement itself (`/v1/*`) arrives in a later phase. |
+| Verifying revocation locally | `/v1` auth not yet wired | Check `audit_logs` for `api_key.revoke` rows, list keys via `GET /dashboard/keys` (revoked keys show `revoked_at`), or query Redis (`KEYS *auth:*` patterns) to confirm the entry is gone. |
+| Password reset needed for a local account | Not yet implemented | Create a second account via `/auth/register`, or (destructive) reset the local DB via `make migrate` after deleting the user row. Do not store plaintext passwords while working around this. |
+
+### 401 vs 403 quick reference
+
+- **401 Unauthorized** — the request has no valid credentials (missing/expired/malformed JWT, or login failure). Re-authenticate.
+- **403 Forbidden** — credentials are valid but the action is not allowed (e.g. acting on another user's API key). Do not retry with the same token.
 
 ## Data and persistence
 
@@ -81,8 +110,8 @@ TODO for production: managed snapshots, tested point-in-time recovery, encrypted
 
 Notes:
 
-- Rotating `API_KEY_PEPPER` invalidates previously hashed API keys; planned key migration/rotation is a later-phase requirement.
-- Rotating `JWT_SECRET` invalidates existing dashboard JWTs; users must sign in again.
+- Rotating `API_KEY_PEPPER` invalidates previously hashed API keys; planned key migration/rotation is a later-phase requirement. Also flush the API-key lookup cache in Redis after rotation (the cached hashes reference the old pepper).
+- Rotating `JWT_SECRET` invalidates existing dashboard JWTs; users must sign in again. Changing `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` affects only newly issued tokens.
 - Rotating `LITELLM_MASTER_KEY` requires updating both API and LiteLLM env values and restarting both.
 - Rotating `POSTGRES_PASSWORD`/`REDIS_PASSWORD` requires updating the DSNs too (`DATABASE_URL`, `REDIS_URL`).
 
@@ -112,3 +141,5 @@ Production on-call ownership, paging, and severity definitions are TODO.
 - Stripe webhook replay/reconciliation procedure
 - Rate-limit/quota incident playbook
 - Alert routing, SLOs, and dashboards
+- Password reset / email verification recovery procedures
+- Production session migration from `sessionStorage` to HttpOnly cookies via a BFF

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 
+import { AccountCard } from "@/components/account-card";
 import { PageHeader, PlaceholderPanel } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 
@@ -25,6 +26,7 @@ export default function DashboardPage() {
           </Button>
         }
       />
+      <AccountCard />
       <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {metrics.map((metric) => (
           <div

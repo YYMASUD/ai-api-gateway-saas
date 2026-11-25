@@ -2,7 +2,7 @@
 
 Production-grade AI API gateway SaaS with credit billing, API keys, usage metering, and OpenAI-compatible routing.
 
-This repository is in **Phase 1**: the infrastructure, CI, and documentation foundation plus application skeletons. It is **not production-ready** and does not deploy anywhere yet.
+This repository is in **Phase 2**: the Phase 1 infrastructure, CI, and documentation foundation plus application skeletons are in place, and Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Inference, billing, and production deployment are still **not implemented**, and the stack does not deploy anywhere yet.
 
 ## What is here
 
@@ -92,6 +92,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details and [docs/SECURITY.
 4. Open:
 
    - Web: <http://localhost:3000>
+   - Dashboard signup/login: <http://localhost:3000/signup> and <http://localhost:3000/login>
    - API docs (non-production): <http://localhost:8000/docs>
    - API liveness: <http://localhost:8000/healthz>
    - API readiness: <http://localhost:8000/readyz>
@@ -133,20 +134,21 @@ make typecheck
 Per application:
 
 ```bash
-# API
+# API (includes Phase 2 auth/key unit tests)
 cd apps/api
 python -m pip install -e ".[dev]"
 python -m pytest
 ruff check .
 mypy app
 
-# Web
+# Web (includes login/signup/keys UI tests; e2e requires browsers, not installed in CI)
 cd apps/web
 npm ci
 npm test
 npm run lint
 npm run typecheck
 npm run build
+# npm run e2e   # skipped in CI: browsers are not installed
 
 # Worker
 cd apps/worker
@@ -156,13 +158,15 @@ ruff check .
 mypy app
 ```
 
+The Phase 2 web UI stores the dashboard JWT in `sessionStorage` so the keys page can call FastAPI directly. This is an interim measure; production must move to HttpOnly cookies behind a BFF (see [docs/SECURITY.md](docs/SECURITY.md)).
+
 The web build reads `NEXT_PUBLIC_API_BASE_URL` at build time; it must be a public origin, never a credential. The local default is `http://localhost:8000`.
 
 `apps/web/.npmrc` pins installs to `https://registry.npmjs.org/`, and CI rejects any `http://` or non-canonical `"resolved"` URL in `package-lock.json` before running `npm ci`.
 
-## Phase 1 status
+## Phase 1 and Phase 2 status
 
-Implemented in this milestone:
+Implemented in Phase 1:
 
 - Local compose topology with the required network/port isolation, health checks, volumes, and AOF persistence
 - LiteLLM config skeleton with env-referenced credentials, timeouts, retries, and fallback placeholders
@@ -172,16 +176,26 @@ Implemented in this milestone:
 - CI for lint/typecheck/unit tests/build, gitleaks, pip-audit, npm audit, and docker compose validation
 - Terraform/monitoring placeholders and Phase 1 documentation
 
+Implemented in Phase 2:
+
+- Self-built email/password authentication in FastAPI: `POST /auth/register`, `POST /auth/login`, `GET /auth/me`
+- Argon2id password hashing; HS256 JWTs with `exp`/`iss`/`aud` claims and a configurable access-token TTL (`JWT_ACCESS_TOKEN_EXPIRE_MINUTES`)
+- API-key lifecycle: `sk_live_` + base62 encoding of 32 random bytes, SHA-256 + pepper hash, 8-character stored prefix (rendered `sk_live_XXXXXXXX`), scopes (`chat:completions`, `models:read`), Redis 60s lookup cache, and revoke-based cache invalidation
+- Dashboard endpoints `GET /dashboard/keys`, `POST /dashboard/keys`, `DELETE /dashboard/keys/{id}`
+- Next.js login/signup pages and a keys UI that store the Bearer JWT in `sessionStorage` as an **interim Phase 2 measure** (see `docs/SECURITY.md`)
+
 Not yet implemented (later phases):
 
 - Real OpenAI-compatible `/v1/chat/completions` and `/v1/models` behavior
-- Dashboard authentication, API-key issuance/revocation, and rate limiting
+- Rate limiting and quota enforcement for API keys
 - Credit reservation/settlement, Stripe checkout/webhooks, usage ingestion, and email delivery
 - LiteLLM virtual keys / database-backed spend tracking
 - Production deployment, TLS/ingress, managed databases, secret-manager wiring, and monitoring stacks
 - Durable audit export, on-call alert routing, and SLOs
+- Migration from interim `sessionStorage` JWTs to HttpOnly cookie / BFF-based session handling
+- Password reset and account recovery flows
 
-See [docs/API.md](docs/API.md) for the implemented vs. planned API surface.
+See [docs/API.md](docs/API.md) for the implemented vs. planned API surface and [docs/SECURITY.md](docs/SECURITY.md) for the auth/key threat model.
 
 ## Assumptions and open questions
 
@@ -203,4 +217,5 @@ Open questions:
 - Email provider choice and deliverability/domain setup are not fixed.
 - Observability backend, retention, alert routing, and on-call ownership are not fixed.
 - Public rate-limit tiers, quota policy, and abuse controls need product sign-off.
+- Timing/design of the production session migration (HttpOnly cookies via a Next.js BFF) and of password reset/email verification flows.
 - The Next.js typed client targets `/healthz`, matching the FastAPI liveness endpoint.

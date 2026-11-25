@@ -2,7 +2,11 @@
 
 ## Scope and status
 
-This document describes the FastAPI gateway's HTTP surface. Phase 1 implements health/readiness probes and the OpenAI-compatible error envelope. User-facing endpoints (inference, key management, billing, dashboard) are scaffolded only; their implementations arrive in later phases.
+This document describes the FastAPI gateway's HTTP surface.
+
+- **Phase 1** implements health/readiness probes and the OpenAI-compatible error envelope.
+- **Phase 2** implements self-built email/password authentication (`/auth/*`) and API-key lifecycle management (`/dashboard/keys*`), both protected by HS256 JWTs.
+- **Later phases** add inference (`/v1/*`), billing/webhooks (`/billing/*`, `/webhooks/*`), usage data, and admin tooling. These are documented as *planned* and are not implemented yet.
 
 ## Base URLs
 
@@ -21,14 +25,16 @@ Every response includes an `X-Request-ID` header. If the request carried a sanit
 
 ### Authentication
 
-| Route group | Phase 1 | Phase 2+ |
+| Route group | Auth mechanism | Phase |
 | --- | --- | --- |
-| `/healthz`, `/readyz` | no auth | no auth |
-| `/v1/*` | no auth dependency wired | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`) |
-| `/dashboard/*` | no auth dependency wired | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) |
-| `/billing/*`, `/webhooks/*`, `/admin/*` | not implemented | API key or JWT as appropriate; webhook signature verification |
+| `/healthz`, `/readyz` | none | 1 (implemented) |
+| `/auth/register`, `/auth/login` | none (public) | 2 (implemented) |
+| `/auth/me` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 2 (implemented) |
+| `/dashboard/keys*` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 2 (implemented) |
+| `/v1/*` | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`) | later (planned) |
+| `/billing/*`, `/webhooks/*`, `/admin/*` | API key or JWT as appropriate; webhook signature verification | later (planned) |
 
-Phase 1 ships the cryptographic helpers (`apps/api/app/core/security.py`) but does not yet wire them as FastAPI dependencies.
+Phase 2 implements email/password authentication and JWT issuance. The cryptographic helpers (`apps/api/app/core/security.py`) are wired as FastAPI dependencies for `/dashboard/*` routes. Inference (`/v1/*`) auth dependencies arrive in a later phase.
 
 ### Error envelope
 
@@ -48,10 +54,11 @@ All errors follow the OpenAI-compatible shape, regardless of the route:
 | HTTP status | `type` | `code` |
 | --- | --- | --- |
 | 400 | `invalid_request_error` | (varies) |
-| 401 | `authentication_error` | `invalid_api_key` |
-| 403 | `permission_error` | `forbidden` |
+| 401 | `authentication_error` | `invalid_api_key` / `invalid_credentials` / `invalid_token` |
+| 403 | `permission_error` | `forbidden` / `insufficient_scope` |
 | 404 | `invalid_request_error` | `not_found` |
 | 405 | `invalid_request_error` | `method_not_allowed` |
+| 409 | `invalid_request_error` | `conflict` (e.g. email already registered) |
 | 422 | `invalid_request_error` | `invalid_request` (with `param` location) |
 | 429 | `rate_limit_error` | `rate_limit_exceeded` |
 | 502 | `api_error` | `upstream_error` |
@@ -103,6 +110,225 @@ The Next.js typed API client targets `/healthz` for its liveness probe, matching
 
 Interactive Swagger UI and the raw OpenAPI schema are available in non-production only (`environment != "production"`). They are disabled in production to avoid exposing internal routes.
 
+## Implemented endpoints (Phase 2)
+
+Phase 2 adds self-built email/password authentication and API-key lifecycle management.
+
+### Authentication
+
+#### `POST /auth/register`
+
+Create a new user account.
+
+**Request:**
+
+```json
+{
+  "email": "user@example.com",
+  "password": "securepassword123",
+  "display_name": "Optional Name"
+}
+```
+
+`display_name` is optional.
+
+**Response (201):** Same envelope as `POST /auth/login` — the new account is created and a token is issued immediately.
+
+```json
+{
+  "access_token": "<jwt-access-token>",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "user": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "email": "user@example.com",
+    "display_name": null,
+    "role": "user",
+    "status": "active",
+    "created_at": "2026-11-26T10:30:00Z"
+  }
+}
+```
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 201 | Account created and token issued |
+| 409 | Email already registered |
+| 422 | Validation error (bad email, or password outside 12–128 chars) |
+
+Password policy: minimum 12 characters, maximum 128 characters. Passwords are hashed with Argon2id before storage. Email addresses are normalised to lowercase and must be unique.
+
+#### `POST /auth/login`
+
+Authenticate and receive a JWT access token.
+
+**Request:**
+
+```json
+{
+  "email": "user@example.com",
+  "password": "securepassword123"
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "access_token": "<jwt-access-token>",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "user": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "email": "user@example.com",
+    "display_name": null,
+    "role": "user",
+    "status": "active",
+    "created_at": "2026-11-26T10:30:00Z"
+  }
+}
+```
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Login successful; JWT issued |
+| 401 | Invalid credentials (generic response; does not distinguish email-not-found vs wrong-password) |
+| 422 | Validation error (missing or malformed fields) |
+
+The JWT contains `sub` (user ID), `exp`, `iss`, and `aud` claims. The `expires_in` value is in seconds and matches `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` (default 60 minutes, range 5–1440).
+
+**Interim token handling:** The Phase 2 web UI stores the JWT in `sessionStorage` so the keys page can call FastAPI directly. Production deployments must migrate to HttpOnly cookies behind a BFF (see `docs/SECURITY.md`).
+
+#### `GET /auth/me`
+
+Retrieve the authenticated user's profile.
+
+**Headers:** `Authorization: Bearer <jwt>`
+
+**Response (200):**
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "email": "user@example.com",
+  "display_name": null,
+  "role": "user",
+  "status": "active",
+  "created_at": "2026-11-26T10:30:00Z"
+}
+```
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Authenticated user returned |
+| 401 | Missing or invalid JWT |
+
+### Dashboard API keys
+
+All `/dashboard/keys*` endpoints require `Authorization: Bearer <jwt>`.
+
+#### `GET /dashboard/keys`
+
+List all API keys for the authenticated user. Raw key values are never returned; only the masked `sk_live_XXXXXXXX` prefix is shown.
+
+**Headers:** `Authorization: Bearer <jwt>`
+
+**Response (200):**
+
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440001",
+    "name": "Production key",
+    "prefix": "sk_live_XXXXXXXX",
+    "scopes": ["chat:completions", "models:read"],
+    "created_at": "2026-11-26T10:30:00Z",
+    "last_used_at": "2026-11-26T14:22:10Z",
+    "revoked_at": null
+  }
+]
+```
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Keys listed (may be empty) |
+| 401 | Missing or invalid JWT |
+
+#### `POST /dashboard/keys`
+
+Create a new API key. The raw key is returned **exactly once** in the response and is never stored or retrievable afterward (the value below is an illustrative placeholder).
+
+**Headers:** `Authorization: Bearer <jwt>`
+
+**Request:**
+
+```json
+{
+  "name": "Production key",
+  "scopes": ["chat:completions", "models:read"]
+}
+```
+
+**Response (201):**
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440001",
+  "name": "Production key",
+  "key": "sk_live_<redacted-once>",
+  "prefix": "sk_live_XXXXXXXX",
+  "scopes": ["chat:completions", "models:read"],
+  "created_at": "2026-11-26T10:30:00Z",
+  "last_used_at": null,
+  "revoked_at": null
+}
+```
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 201 | Key created; raw value returned once |
+| 401 | Missing or invalid JWT |
+| 422 | Validation error (blank/oversized name, unknown scope) |
+
+**Key format:** `sk_live_` prefix followed by base62-encoded random material generated from 32 cryptographically random bytes. The stored `key_hash` is `SHA-256(raw_key + API_KEY_PEPPER)`, hex-encoded; the raw key is never persisted. The `prefix` column stores the first 8 characters of the random part; the API renders it as `sk_live_XXXXXXXX` for display.
+
+**Scopes:** Currently supported scopes are `chat:completions` and `models:read`. At least one scope is required.
+
+**Redis lookup cache:** API-key lookups are cached in Redis for 60 seconds. Revocation deletes the entry immediately (see below). The cache backs the API-key auth dependency; the `/v1/*` inference routes that consume it arrive in a later phase.
+
+**Audit log:** Key creation is recorded in `audit_logs` with actor, action (`api_key.create`), and resource ID. The raw key and hash are never logged.
+
+#### `DELETE /dashboard/keys/{id}`
+
+Revoke an API key.
+
+**Headers:** `Authorization: Bearer <jwt>`
+
+**Response (204):** No content.
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 204 | Key revoked successfully |
+| 401 | Missing or invalid JWT |
+| 403 | Key does not belong to the authenticated user |
+| 404 | Key not found |
+
+**Revocation behavior:** The `revoked_at` timestamp is set on the `api_keys` row and the Redis cache entry for the key hash is deleted immediately, so the key stops authenticating on the next request. If the cache delete fails, the key remains usable for at most the 60-second cache TTL (stale-but-bounded). Revocation is idempotent at the data level; revoking an already-revoked key is a no-op that still returns `204`.
+
+**Audit log:** Key revocation is recorded in `audit_logs` with actor, action (`api_key.revoke`), and resource ID.
+
 ## Planned endpoints (later phases)
 
 These routes are registered but currently return placeholder responses. They are listed here so clients can be shaped against a stable contract.
@@ -111,27 +337,24 @@ These routes are registered but currently return placeholder responses. They are
 
 | Method | Path | Phase | Notes |
 | --- | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | 2 | Streaming and non-streaming; API-key auth; forwards to LiteLLM with master key; records `usage_events` and settles credits |
-| `GET` | `/v1/models` | 2 | Lists models the authenticated key is allowed to call; admin sees all |
+| `POST` | `/v1/chat/completions` | later | Streaming and non-streaming; API-key auth; forwards to LiteLLM with master key; records `usage_events` and settles credits |
+| `GET` | `/v1/models` | later | Lists models the authenticated key is allowed to call; admin sees all |
 
-### Dashboard
+### Dashboard (additional endpoints)
 
 | Method | Path | Phase | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/dashboard/*` | 3 | JWT-protected pages and data endpoints |
-| `POST` | `/dashboard/auth/login` | 3 | Returns a signed JWT |
-| `GET` | `/dashboard/keys` | 3 | Lists masked API keys |
-| `POST` | `/dashboard/keys` | 3 | Issues a new API key; raw value returned once |
-| `DELETE` | `/dashboard/keys/{id}` | 3 | Revokes a key |
-| `GET` | `/dashboard/usage` | 3 | Per-key, per-day, per-model aggregates |
-| `GET` | `/dashboard/billing` | 4 | Credit balance, plan, upcoming invoice |
+| `GET` | `/dashboard/usage` | later | Per-key, per-day, per-model aggregates |
+| `GET` | `/dashboard/billing` | later | Credit balance, plan, upcoming invoice |
+
+> **Note:** Authentication (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`) and API-key lifecycle (`GET/POST/DELETE /dashboard/keys*`) are implemented in Phase 2. See the "Implemented endpoints (Phase 2)" section above.
 
 ### Billing and webhooks
 
 | Method | Path | Phase | Notes |
 | --- | --- | --- | --- |
-| `POST` | `/billing/checkout` | 4 | Creates a Stripe Checkout session |
-| `POST` | `/webhooks/stripe` | 4 | Verifies signature, idempotent event processing |
+| `POST` | `/billing/checkout` | later | Creates a Stripe Checkout session |
+| `POST` | `/webhooks/stripe` | later | Verifies signature, idempotent event processing |
 
 ### Admin
 
@@ -144,19 +367,22 @@ These routes are registered but currently return placeholder responses. They are
 | Header | Direction | Description |
 | --- | --- | --- |
 | `X-Request-ID` | both | Request correlation ID (sanitized; max 128 chars). |
-| `Authorization` | request | `Bearer <api_key>` for `/v1`, `Bearer <jwt>` for `/dashboard`. |
+| `Authorization` | request | `Bearer <jwt>` for `/auth/me` and `/dashboard/*`; `Bearer <api_key>` for `/v1` (later phase). |
 | `Content-Type` | both | `application/json` for JSON bodies. |
 | `Accept` | request | `application/json` expected. |
 
 ## CORS
 
-CORS is applied to dashboard routes only. The allowed origin is derived from `APP_URL` (scheme + host + port). The public `/v1` API is not CORS-enabled; browser clients should not call it directly.
+CORS is applied to all routes except the public `/v1` surface. The allowed origin is derived from `APP_URL` (scheme + host + port), which is why the dashboard origin can call `/auth/*` and `/dashboard/*` directly with a Bearer token. The public `/v1` API is not CORS-enabled; browser clients should not call it directly.
+
+Because the browser currently sends the JWT as a Bearer header (see the interim `sessionStorage` note), CORS allows the `Authorization` header. Once the dashboard moves to HttpOnly cookies behind a BFF, the browser will stop holding the token and `allow_credentials` will be scoped to the BFF origin.
 
 ## Compatibility notes
 
-- The `/v1` surface is intended to be OpenAI-compatible for request/response shapes and error codes. Streaming (`stream: true`) and advanced features (function calling, responses API) are Phase 2+.
+- The `/v1` surface is intended to be OpenAI-compatible for request/response shapes and error codes. Streaming (`stream: true`) and advanced features (function calling, responses API) are later phases.
 - Money is represented as integer **microcredits** (`1,000,000 microcredits = 1 credit`). No floating-point currency values are stored or returned.
-- Rate limiting, quota enforcement, and per-key spend caps are not enforced in Phase 1.
+- Rate limiting, quota enforcement, and per-key spend caps are not enforced yet.
+- Auth and API-key management are implemented in Phase 2; inference (`/v1/*`), billing, webhooks, usage data, and admin tooling remain later phases.
 
 ## Versioning and deprecation
 

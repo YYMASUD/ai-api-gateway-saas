@@ -6,7 +6,8 @@
  *   design (it ends up in the browser bundle), so it must never contain
  *   credentials.
  * - No API key, token, or secret is baked into this file. Callers pass an
- *   optional bearer token per request; it is never persisted here.
+ *   optional bearer token per client instance; it is never persisted here and
+ *   never logged.
  */
 
 const LOCAL_DEFAULT_BASE_URL = "http://localhost:8000";
@@ -31,18 +32,66 @@ export interface ModelListResponse {
   data: Model[];
 }
 
+/** Account record returned by `/auth/*` and `/auth/me`. */
+export interface AuthUser {
+  id: string;
+  email: string;
+  display_name: string | null;
+  role: string;
+  status: string;
+  created_at: string;
+}
+
+/** Login/registration envelope. The access token is short-lived. */
+export interface TokenResponse {
+  access_token: string;
+  token_type: "bearer" | string;
+  expires_in: number;
+  user: AuthUser;
+}
+
+export interface RegisterRequest {
+  email: string;
+  password: string;
+  display_name?: string;
+}
+
+export interface LoginRequest {
+  email: string;
+  password: string;
+}
+
+/** Metadata for an issued gateway key. The secret is only returned on create. */
 export interface ApiKey {
   id: string;
   name: string;
-  /** Only a masked preview should ever come back from the server. */
-  masked_key?: string;
-  created_at?: string;
+  /** Masked preview such as `sk_live_XXXXXXXX`; safe to render. */
+  prefix: string;
+  scopes: string[];
+  last_used_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+/**
+ * Response of `POST /dashboard/keys`; `key` is shown exactly once. The create
+ * response omits usage/revocation metadata, so those fields are optional.
+ */
+export interface CreatedApiKey {
+  id: string;
+  name: string;
+  prefix: string;
+  scopes: string[];
+  created_at: string;
+  /** Full plaintext key. Never persist this value anywhere. */
+  key: string;
   last_used_at?: string | null;
   revoked_at?: string | null;
 }
 
 export interface CreateKeyRequest {
   name: string;
+  scopes?: string[];
 }
 
 export interface BillingSummary {
@@ -67,21 +116,32 @@ export interface UsageSummary {
   records: UsageRecord[];
 }
 
-interface ApiErrorBody {
-  detail?: string;
-  error?: string;
-  message?: string;
+interface OpenAIErrorEnvelope {
+  error?: unknown;
+  detail?: unknown;
+  message?: unknown;
 }
 
 export class ApiError extends Error {
   readonly status: number;
   readonly body: unknown;
+  /** OpenAI-style machine-readable error code, when present. */
+  readonly code: string | null;
+  /** OpenAI-style error type, when present. */
+  readonly type: string | null;
 
-  constructor(message: string, status: number, body: unknown) {
+  constructor(
+    message: string,
+    status: number,
+    body: unknown,
+    meta: { code?: string | null; type?: string | null } = {},
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.body = body;
+    this.code = meta.code ?? null;
+    this.type = meta.type ?? null;
   }
 }
 
@@ -137,11 +197,17 @@ export interface ApiClient {
   /** Gateway liveness probe (`GET /healthz`), implemented in Phase 1. */
   health(): Promise<HealthStatus>;
   listModels(): Promise<ModelListResponse>;
-  /** Later-phase placeholder: `GET /v1/keys` is not implemented yet. */
+  /** Create an account (`POST /auth/register`). */
+  register(body: RegisterRequest): Promise<TokenResponse>;
+  /** Exchange credentials for a dashboard JWT (`POST /auth/login`). */
+  login(body: LoginRequest): Promise<TokenResponse>;
+  /** Resolve the current account from the bearer token (`GET /auth/me`). */
+  me(): Promise<AuthUser>;
+  /** List key metadata (`GET /dashboard/keys`). Never returns plaintext keys. */
   listKeys(): Promise<ApiKey[]>;
-  /** Later-phase placeholder: `POST /v1/keys` is not implemented yet. */
-  createKey(body: CreateKeyRequest): Promise<ApiKey>;
-  /** Later-phase placeholder: `DELETE /v1/keys/{id}` is not implemented yet. */
+  /** Issue a key (`POST /dashboard/keys`); includes the one-time secret. */
+  createKey(body: CreateKeyRequest): Promise<CreatedApiKey>;
+  /** Revoke a key (`DELETE /dashboard/keys/{id}`). */
   revokeKey(id: string): Promise<void>;
   /** Later-phase placeholder: `GET /v1/billing/summary` is not implemented yet. */
   getBillingSummary(): Promise<BillingSummary>;
@@ -215,10 +281,12 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       : await response.text().catch(() => null);
 
     if (!response.ok) {
+      const parsed = parseErrorPayload(payload);
       throw new ApiError(
-        extractErrorMessage(payload) ?? `Request failed with ${response.status}`,
+        parsed.message ?? `Request failed with ${response.status}`,
         response.status,
         payload,
+        { code: parsed.code, type: parsed.type },
       );
     }
 
@@ -230,24 +298,66 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     request,
     health: () => request<HealthStatus>("/healthz"),
     listModels: () => request<ModelListResponse>("/v1/models"),
-    // Later-phase placeholders below: the gateway does not serve the
-    // keys/billing/usage routes yet. Paths are reserved so this typed surface
-    // stays stable when those phases land.
-    listKeys: () => request<ApiKey[]>("/v1/keys"),
-    createKey: (body) => request<ApiKey>("/v1/keys", { method: "POST", body }),
+    register: (body) =>
+      request<TokenResponse>("/auth/register", { method: "POST", body }),
+    login: (body) =>
+      request<TokenResponse>("/auth/login", { method: "POST", body }),
+    me: () => request<AuthUser>("/auth/me"),
+    listKeys: () => request<ApiKey[]>("/dashboard/keys"),
+    createKey: (body) =>
+      request<CreatedApiKey>("/dashboard/keys", { method: "POST", body }),
     revokeKey: (id) =>
-      request<void>(`/v1/keys/${encodeURIComponent(id)}`, {
+      request<void>(`/dashboard/keys/${encodeURIComponent(id)}`, {
         method: "DELETE",
       }),
+    // Later-phase placeholders below: paths are reserved so this typed surface
+    // stays stable when billing and usage land.
     getBillingSummary: () => request<BillingSummary>("/v1/billing/summary"),
     getUsage: () => request<UsageSummary>("/v1/usage"),
   };
 }
 
-function extractErrorMessage(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== "object") return undefined;
-  const body = payload as ApiErrorBody;
-  return body.detail ?? body.error ?? body.message;
+interface ParsedError {
+  message?: string;
+  code: string | null;
+  type: string | null;
+}
+
+/**
+ * Parse the gateway's OpenAI-compatible error envelope
+ * `{ error: { message, type, param, code } }`, while remaining tolerant of
+ * plain FastAPI detail strings and legacy shapes.
+ */
+function parseErrorPayload(payload: unknown): ParsedError {
+  if (!payload || typeof payload !== "object") {
+    return { code: null, type: null };
+  }
+
+  const body = payload as OpenAIErrorEnvelope;
+  if (body.error && typeof body.error === "object") {
+    const nested = body.error as {
+      message?: unknown;
+      type?: unknown;
+      code?: unknown;
+    };
+    return {
+      message:
+        typeof nested.message === "string" ? nested.message : undefined,
+      type: typeof nested.type === "string" ? nested.type : null,
+      code: typeof nested.code === "string" ? nested.code : null,
+    };
+  }
+
+  if (typeof body.detail === "string") {
+    return { message: body.detail, code: null, type: null };
+  }
+  if (typeof body.error === "string") {
+    return { message: body.error, code: null, type: null };
+  }
+  if (typeof body.message === "string") {
+    return { message: body.message, code: null, type: null };
+  }
+  return { code: null, type: null };
 }
 
 /** Shared client for server components / route handlers. */

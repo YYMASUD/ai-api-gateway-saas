@@ -5,20 +5,23 @@ is a server-side secret loaded from the environment, so a database leak alone
 does not reveal usable keys. Verification uses a constant-time comparison.
 
 JWTs are pinned to HS256 and every verification requires ``exp``, ``iss`` and
-``aud`` claims. Phase 1 exposes the helpers only; auth dependencies arrive in a
-later phase.
+``aud`` claims. Access tokens additionally carry ``iat``, ``jti`` and
+``type="access"``; the auth dependency enforces the token type.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import time
+import uuid
 from typing import Any
 
 import jwt
 
 JWT_ALGORITHM = "HS256"
 JWT_REQUIRED_CLAIMS = ["exp", "iss", "aud"]
+ACCESS_TOKEN_TYPE = "access"
 
 
 class TokenVerificationError(Exception):
@@ -86,3 +89,34 @@ def verify_jwt(
     except jwt.InvalidTokenError as exc:
         raise TokenVerificationError("invalid token") from exc
     return claims
+
+
+def create_access_token(
+    subject: str,
+    secret: str,
+    issuer: str,
+    audience: str,
+    expires_minutes: int,
+) -> str:
+    """Issue a short-lived HS256 access token for a dashboard user.
+
+    Claims: ``sub``, ``iss``, ``aud``, ``iat``, ``exp``, ``jti`` and
+    ``type="access"``. The algorithm is pinned to HS256; callers must never
+    log the returned token.
+    """
+    if not subject or not secret or not issuer or not audience:
+        raise ValueError("missing access token parameters")
+    if expires_minutes <= 0:
+        raise ValueError("expires_minutes must be positive")
+    now = int(time.time())
+    claims = {
+        "sub": subject,
+        "iss": issuer,
+        "aud": audience,
+        "iat": now,
+        "exp": now + expires_minutes * 60,
+        "jti": str(uuid.uuid4()),
+        "type": ACCESS_TOKEN_TYPE,
+    }
+    token: str = jwt.encode(claims, secret, algorithm=JWT_ALGORITHM)
+    return token

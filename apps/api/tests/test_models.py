@@ -24,6 +24,7 @@ REQUIRED_FIELDS: dict[str, set[str]] = {
         "id",
         "email",
         "auth_provider_id",
+        "password_hash",
         "role",
         "status",
         "spend_cap_monthly_cents",
@@ -128,7 +129,6 @@ LEGACY_FIELDS = {
     "resource_id",
     "model_name",
     "is_active",
-    "password_hash",
     "metadata_json",
     "payload_json",
 }

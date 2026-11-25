@@ -90,6 +90,8 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Additive: dashboard display label; not part of the required Phase 1 set.
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     auth_provider_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Argon2id hash for local email/password auth; null for OAuth-only accounts.
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     role: Mapped[str] = mapped_column(
         String(32), nullable=False, default="user", server_default="user"
     )
@@ -119,7 +121,8 @@ class APIKey(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # First 8 characters of the plaintext key, shown in the UI for identification.
+    # First 8 characters of the key's random part (after ``sk_live_``); the UI
+    # renders it as ``sk_live_XXXXXXXX``. The full key is never stored.
     prefix: Mapped[str] = mapped_column(String(8), nullable=False)
     # SHA-256(plaintext_key + API_KEY_PEPPER), hex encoded.
     key_hash: Mapped[str] = mapped_column(String(64), nullable=False)

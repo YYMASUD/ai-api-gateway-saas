@@ -93,6 +93,24 @@ def test_timeouts_must_be_positive(env: dict[str, str], monkeypatch: pytest.Monk
         Settings()
 
 
+def test_access_token_ttl_default(settings: Settings) -> None:
+    assert settings.jwt_access_token_expire_minutes == 60
+
+
+def test_access_token_ttl_from_env(env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30")
+    assert Settings().jwt_access_token_expire_minutes == 30
+
+
+@pytest.mark.parametrize("value", ["4", "1441", "0", "-5"])
+def test_access_token_ttl_bounds(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", value)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
 def test_settings_have_no_secret_defaults() -> None:
     for field in (
         "database_url",
