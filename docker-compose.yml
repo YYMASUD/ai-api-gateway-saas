@@ -121,6 +121,7 @@ services:
     image: ai-api-gateway-saas/worker:local
     environment:
       REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
+      # Reserved for later phases; the worker skeleton does not read DATABASE_URL yet.
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       WORKER_QUEUE_NAME: ${WORKER_QUEUE_NAME:-arq:queue}
       WORKER_MAX_JOBS: ${WORKER_MAX_JOBS:-16}

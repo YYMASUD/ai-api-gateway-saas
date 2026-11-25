@@ -111,6 +111,20 @@ def test_api_error_handler(app: FastAPI) -> None:
     }
 
 
+def test_generic_401_http_exception_uses_invalid_token_code(app: FastAPI) -> None:
+    from fastapi import HTTPException
+
+    @app.get("/_test/generic-401")
+    async def generic_401() -> None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with TestClient(app) as client:
+        response = client.get("/_test/generic-401")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_token"
+    assert response.json()["error"]["type"] == "authentication_error"
+
+
 def test_unhandled_error_handler_returns_generic_message(app: FastAPI) -> None:
     @app.get("/_test/boom")
     async def boom() -> None:

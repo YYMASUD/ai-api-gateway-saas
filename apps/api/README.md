@@ -20,7 +20,7 @@ Required environment variables:
 All of the above must be non-blank; startup fails fast otherwise. Never commit
 real values.
 
-Optional: `ENVIRONMENT`, `LOG_LEVEL`, `APP_URL`, `API_BASE_URL`,
+Optional: `ENVIRONMENT`, `LOG_LEVEL`, `APP_URL`,
 `LITELLM_BASE_URL`, `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_ALGORITHM` (must be
 `HS256`), `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` (default `60`, allowed range
 `5`–`1440`), `HTTP_CONNECT_TIMEOUT`, `HTTP_READ_TIMEOUT`,
@@ -88,10 +88,12 @@ Additional details:
   `{access_token, token_type, expires_in, user}` with status `201`. Duplicate
   email returns `409` with code `email_exists`.
 - `POST /auth/login` — `{email, password}`; returns the same token envelope.
-  Invalid credentials return a generic `401 invalid_credentials`; suspended
-  accounts return `403 user_suspended`.
+  Unknown emails, wrong passwords, and suspended accounts all return the
+  same generic `401 invalid_credentials`, so login never reveals account
+  existence or suspension state.
 - `GET /auth/me` — requires `Authorization: Bearer <jwt>` and returns the
-  current user.
+  current user. An authenticated suspended user still gets
+  `403 user_suspended` (authenticated context, not a login oracle).
 
 JWTs are HS256, required claims are `exp`/`iss`/`aud`, and access tokens also
 carry `iat`, `jti`, and `type=access`. `expires_in` is
@@ -100,8 +102,9 @@ carry `iat`, `jti`, and `type=access`. `expires_in` is
 ### Phase 2 API keys (`/dashboard/keys`, JWT protected)
 
 - `POST /dashboard/keys` — `{name, scopes?}`; returns
-  `{id, name, prefix, key, scopes, created_at}` with status `201`. `key` is the
-  full secret and is returned exactly once. Allowed scopes are
+  `{id, name, prefix, key, scopes, last_used_at, revoked_at, created_at}` with
+  status `201`; `last_used_at` and `revoked_at` are `null` at creation. `key`
+  is the full secret and is returned exactly once. Allowed scopes are
   `chat:completions` and `models:read` (default: both); unknown scopes return
   `422`.
 - `GET /dashboard/keys` — returns a JSON array of
@@ -109,11 +112,15 @@ carry `iat`, `jti`, and `type=access`. `expires_in` is
   includes the full key or hash.
 - `DELETE /dashboard/keys/{id}` — owner-only revocation; `204`, idempotent,
   sets `revoked_at`, purges the Redis cache entry immediately, and writes an
-  `api_key.revoke` audit record.
+  `api_key.revoke` audit record. Unknown keys and keys owned by another user
+  both return `404 not_found` (no cross-user enumeration).
 
 API keys use the format `sk_live_` + 43 base62 characters derived from 32
 random bytes. Lookups cache the positive principal in Redis as
 `apikey:<sha256hex>` for 60 seconds; Redis failures fail open to Postgres.
+`last_used_at` is updated only on cache misses, so its granularity is
+approximately the 60-second cache TTL. Keys belonging to suspended users
+fail with the same `401 invalid_api_key` as unknown or revoked keys.
 Creating a key writes an `api_key.create` audit record. Audit metadata contains
 only non-secret fields (`name`, `scopes`).
 

@@ -48,6 +48,7 @@ _EXACT_SENSITIVE_KEYS = frozenset(
         "master_key",
         "api_key_pepper",
         "pepper",
+        "key_hash",
         "database_url",
         "redis_url",
         "dsn",

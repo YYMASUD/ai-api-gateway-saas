@@ -27,7 +27,7 @@ Primary threats:
 | Provider key leaked to browser/web | Provider keys only injected into LiteLLM container; web env has public origins only | Enforce with policy/admission checks in deployment |
 | Direct access to private services | No published ports for Postgres/Redis/LiteLLM/worker; single private network | Private VPC/subnet and security groups in Terraform |
 | Credential stuffing / weak passwords | Argon2id hashing; 12–128 char policy; generic invalid-credential responses | Rate limiting, lockout/backoff, MFA, breached-password checks |
-| API key theft/leak | `sk_live_` + 32 random bytes; SHA-256+pepper hash (raw never stored); 8-char prefix only; constant-time compare; revoke invalidates Redis cache | Rate limits, per-key spend caps, rotation automation |
+| API key theft/leak | `sk_live_` + 32 random bytes; SHA-256+pepper hash (raw never stored); 8-char prefix only; deterministic peppered-hash lookup (constant-time compare helper available); revoke invalidates Redis cache | Rate limits, per-key spend caps, rotation automation |
 | JWT forgery/replay | HS256 pinned in code and config; required `exp`, `iss`, `aud`; short TTL via `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Token revocation list, signing-key rotation, move browser tokens to HttpOnly cookies |
 | Dashboard token exposure (XSS) | Interim `sessionStorage` storage — **accepted risk for Phase 2 only** | Migrate to HttpOnly cookies behind a BFF |
 | Stripe webhook forgery | Env-only webhook secret placeholder | Verify signatures; idempotent event processing; replay protection |
@@ -59,9 +59,9 @@ openssl rand -hex 24   # POSTGRES_PASSWORD / REDIS_PASSWORD
 
 ### Passwords
 
-- Hashing: **Argon2id** via a vetted library; parameters use library defaults suitable for interactive login. Raw passwords are never logged or stored.
+- Hashing: **Argon2id** via a vetted library; parameters are pinned in code (time_cost=3, memory_cost=64 MB, parallelism=4, 32-byte hash, 16-byte salt), suitable for interactive login. Raw passwords are never logged or stored.
 - Policy: **12–128 characters**; email is normalised to lowercase and must be unique.
-- **Generic invalid-credential responses.** `POST /auth/login` returns a single `401` body that does not reveal whether the email exists or the password was wrong. Registration conflict (`409`) is the only place email existence is surfaced, and only through account creation.
+- **Generic invalid-credential responses.** `POST /auth/login` returns a single `401` body that does not reveal whether the email exists, the password was wrong, or the account is suspended. Registration conflict (`409`) is the only place email existence is surfaced, and only through account creation. Suspended accounts still receive `403 user_suspended` on already-authenticated routes such as `GET /auth/me`.
 - Password reset / email verification are **not yet available** (later phase); treat accounts without recovery accordingly.
 
 ### JWTs
@@ -75,9 +75,9 @@ openssl rand -hex 24   # POSTGRES_PASSWORD / REDIS_PASSWORD
 
 - Format: `sk_live_` + base62 encoding of **32 random bytes** from a CSPRNG.
 - Storage: only `SHA-256(raw_key + API_KEY_PEPPER)` (hex) and the **8-character prefix** are persisted; raw keys are shown **once** at creation and never retrievable.
-- Verification uses a constant-time comparison of the recomputed hash.
+- Verification recomputes `SHA-256(raw_key + API_KEY_PEPPER)` and looks it up by indexed equality against `api_keys.key_hash`; a constant-time comparison helper (`verify_api_key`) exists for direct hash comparison.
 - Scopes: explicit allowlist (`chat:completions`, `models:read`); unknown scopes are rejected with `422`.
-- Lookup cache: successful key lookups are cached in Redis for **60 seconds**. Revocation deletes the cache entry immediately; if that delete fails, the key stops working within the 60s TTL (stale-but-bounded). API keys are only meaningful once `/v1` auth is wired (later phase).
+- Lookup cache: successful key lookups are cached in Redis for **60 seconds**. Revocation deletes the cache entry immediately; if that delete fails, the key stops working within the 60s TTL (stale-but-bounded). A cached principal for a subsequently suspended user can also continue to authenticate for at most this 60s window; suspension is not yet an immediate cache purge trigger. `last_used_at` is written on the DB-lookup (cache-miss) path, so its granularity is approximately the 60s cache TTL. API keys are only meaningful once `/v1` auth is wired (later phase).
 
 ### Audit logging
 
@@ -136,7 +136,7 @@ Required production migration:
 7. Add secret-manager injection and rotation runbooks (including JWT signing-key rotation and API-key pepper rotation); rotate any value that may have been exposed.
 8. Enable metrics, traces, alerting, and retention with defined SLOs/on-call ownership.
 9. Harden CSP with a nonce/hash strategy so `script-src 'unsafe-inline'` can be removed.
-10. Pin all third-party images by digest (LiteLLM is pinned; Postgres/Redis tags should also be pinned) and scan images. Run containers with `read_only: true`, `cap_drop: ALL`, and `security_opt: ["no-new-privileges:true"]` where the image allows it; these are documented production requirements and are not set on the local dev stack.
+10. Pin all third-party images by digest (LiteLLM is pinned; Postgres/Redis tags should also be pinned) and scan images. In production, also add runtime hardening where the image permits it (`cap_drop: ALL`, `security_opt: ["no-new-privileges:true"]`, and a read-only root filesystem with explicit writable mounts). These are deployment requirements and are not set on the local dev stack.
 11. Add dependency lockfiles/SBOMs, automated patch PRs, and release signing.
 12. Perform an external security review and dependency/container scan before launch.
 

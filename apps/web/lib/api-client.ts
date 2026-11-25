@@ -75,7 +75,9 @@ export interface ApiKey {
 
 /**
  * Response of `POST /dashboard/keys`; `key` is shown exactly once. The create
- * response omits usage/revocation metadata, so those fields are optional.
+ * response also includes `last_used_at` and `revoked_at` (both `null` for a
+ * brand-new key). They stay optional here only for tolerance of older
+ * deployments; treat their absence as `null`, never as "unknown".
  */
 export interface CreatedApiKey {
   id: string;
@@ -145,6 +147,17 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * True when a failure means the current session is no longer usable: an
+ * expired/invalid token (401) or a suspended account (403 / `user_suspended`).
+ * Dashboard surfaces use this to clear the stored token exactly once.
+ */
+export function isSessionInvalidError(cause: unknown): cause is ApiError {
+  if (!(cause instanceof ApiError)) return false;
+  if (cause.status === 401) return true;
+  return cause.status === 403 || cause.code === "user_suspended";
+}
+
 export interface ApiClientOptions {
   /** Overrides `NEXT_PUBLIC_API_BASE_URL`; mainly for tests. */
   baseUrl?: string;
@@ -191,6 +204,18 @@ export function joinUrl(baseUrl: string, path: string): string {
   return `${normalizedBase}${normalizedPath}`;
 }
 
+/**
+ * Abort failures surface as `Error` or `DOMException` depending on the
+ * runtime, so detect them by name rather than by prototype chain.
+ */
+function isAbortError(cause: unknown): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    (cause as { name?: unknown }).name === "AbortError"
+  );
+}
+
 export interface ApiClient {
   readonly baseUrl: string;
   request<T>(path: string, options?: RequestOptions): Promise<T>;
@@ -209,9 +234,9 @@ export interface ApiClient {
   createKey(body: CreateKeyRequest): Promise<CreatedApiKey>;
   /** Revoke a key (`DELETE /dashboard/keys/{id}`). */
   revokeKey(id: string): Promise<void>;
-  /** Later-phase placeholder: `GET /v1/billing/summary` is not implemented yet. */
+  /** Later-phase placeholder: `GET /dashboard/billing` is not implemented yet. */
   getBillingSummary(): Promise<BillingSummary>;
-  /** Later-phase placeholder: `GET /v1/usage` is not implemented yet. */
+  /** Later-phase placeholder: `GET /dashboard/usage` is not implemented yet. */
   getUsage(): Promise<UsageSummary>;
 }
 
@@ -237,60 +262,89 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     if (token) headers.Authorization = `Bearer ${token}`;
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    // `timedOut` lets us tell our own deadline apart from caller cancellation
+    // once both funnel into the same AbortController.
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+
+    const forwardAbort = () => controller.abort();
     if (signal) {
       if (signal.aborted) {
         controller.abort();
       } else {
-        signal.addEventListener("abort", () => controller.abort(), {
-          once: true,
-        });
+        signal.addEventListener("abort", forwardAbort, { once: true });
       }
     }
 
-    let response: Response;
+    const toRequestError = (cause: unknown): ApiError => {
+      if (isAbortError(cause)) {
+        // Our own deadline takes precedence; anything else that aborted the
+        // request came from the caller's signal.
+        return timedOut
+          ? new ApiError(
+              `Request to ${url} timed out after ${timeoutMs}ms`,
+              0,
+              cause,
+            )
+          : new ApiError(`Request to ${url} was cancelled`, 0, cause);
+      }
+      return new ApiError(`Network request to ${url} failed`, 0, cause);
+    };
+
     try {
-      response = await fetchImpl(url, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: controller.signal,
-        credentials: "omit",
-        cache: "no-store",
-      });
-    } catch (cause) {
-      throw new ApiError(
-        cause instanceof Error && cause.name === "AbortError"
-          ? `Request to ${url} timed out after ${timeoutMs}ms`
-          : `Network request to ${url} failed`,
-        0,
-        cause,
-      );
+      let response: Response;
+      try {
+        response = await fetchImpl(url, {
+          method,
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: controller.signal,
+          credentials: "omit",
+          cache: "no-store",
+        });
+      } catch (cause) {
+        throw toRequestError(cause);
+      }
+
+      if (response.status === 204) {
+        // Void endpoints (e.g. DELETE) resolve to undefined.
+        return undefined as unknown as T;
+      }
+
+      // Keep the timeout armed while the body streams: `fetch` resolves as soon
+      // as headers arrive, so a stalled body would otherwise hang forever.
+      let payload: unknown;
+      try {
+        const contentType = response.headers.get("content-type") ?? "";
+        payload = contentType.includes("application/json")
+          ? await response.json()
+          : await response.text();
+      } catch (cause) {
+        if (isAbortError(cause)) {
+          throw toRequestError(cause);
+        }
+        // Non-JSON or malformed bodies are tolerated as an empty payload.
+        payload = null;
+      }
+
+      if (!response.ok) {
+        const parsed = parseErrorPayload(payload);
+        throw new ApiError(
+          parsed.message ?? `Request failed with ${response.status}`,
+          response.status,
+          payload,
+          { code: parsed.code, type: parsed.type },
+        );
+      }
+
+      return payload as T;
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", forwardAbort);
     }
-
-    if (response.status === 204) {
-      // Void endpoints (e.g. DELETE) resolve to undefined.
-      return undefined as unknown as T;
-    }
-
-    const contentType = response.headers.get("content-type") ?? "";
-    const payload: unknown = contentType.includes("application/json")
-      ? await response.json().catch(() => null)
-      : await response.text().catch(() => null);
-
-    if (!response.ok) {
-      const parsed = parseErrorPayload(payload);
-      throw new ApiError(
-        parsed.message ?? `Request failed with ${response.status}`,
-        response.status,
-        payload,
-        { code: parsed.code, type: parsed.type },
-      );
-    }
-
-    return payload as T;
   }
 
   return {
@@ -310,10 +364,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       request<void>(`/dashboard/keys/${encodeURIComponent(id)}`, {
         method: "DELETE",
       }),
-    // Later-phase placeholders below: paths are reserved so this typed surface
-    // stays stable when billing and usage land.
-    getBillingSummary: () => request<BillingSummary>("/v1/billing/summary"),
-    getUsage: () => request<UsageSummary>("/v1/usage"),
+    // Later-phase placeholders below: paths follow the documented future
+    // dashboard contract so this typed surface stays stable when they land.
+    getBillingSummary: () => request<BillingSummary>("/dashboard/billing"),
+    getUsage: () => request<UsageSummary>("/dashboard/usage"),
   };
 }
 

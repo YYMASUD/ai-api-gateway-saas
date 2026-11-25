@@ -66,20 +66,20 @@ Expected Phase 2 behavior:
 | --- | --- | --- |
 | `POST /auth/register` returns 409 | Email already registered | Login instead, or register with a different address. There is no self-service password reset yet. |
 | `POST /auth/register` returns 422 | Email format, or password outside 12–128 chars | Fix the input; pydantic returns the field location in the error body. |
-| `POST /auth/login` returns 401 for a known account | Generic invalid-credential response (anti-enumeration) | Verify the password; if the user truly forgot, wait for the Phase 3 password-reset flow. Do not bypass by editing the DB directly. |
+| `POST /auth/login` returns 401 for a known account | Generic invalid-credential response (anti-enumeration) | Verify the password; if the user truly forgot, wait for a later-phase password-reset flow. Do not bypass by editing the DB directly. |
 | `GET /auth/me` returns 401 | Missing `Authorization` header, expired JWT, or wrong `iss`/`aud` | Re-login to obtain a fresh token. `expires_in` matches `JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60` (default 3600s). |
 | JWT accepted locally but rejected elsewhere | Different `JWT_ISSUER`/`JWT_AUDIENCE`/`JWT_SECRET` on the verifier | Ensure every service that validates tokens shares the same three values. HS256 is pinned; `JWT_ALGORITHM` rejects anything else. |
 | Change to `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` has no effect on existing sessions | TTL is enforced by the `exp` claim baked into issued tokens | Existing tokens keep their original expiry. New logins pick up the new TTL. Range is 5–1440 minutes. |
-| `/dashboard/keys*` returns 403 | Key ID exists but belongs to a different user | Owner-only enforcement is correct; do not weaken it. Use the owning account or an admin path (later phase). |
-| `POST /dashboard/keys` returns 422 | Blank/oversized name (>64 chars) or unknown scope | Use only `chat:completions` and/or `models:read`. |
+| `/dashboard/keys*` returns 404 | Key ID does not exist or belongs to a different user (existence is deliberately not revealed) | Use the owning account; do not weaken the 404 behavior. |
+| `POST /dashboard/keys` returns 422 | Blank/oversized name (>64 chars), unknown scope, or an empty scopes list | Use only `chat:completions` and/or `models:read`, with at least one scope. |
 | Revoked key still authenticates for up to ~60s | Stale Redis lookup cache (bounded) | Confirm the `DELETE /dashboard/keys/{id}` returned 204 and that `api_keys.revoked_at` is set. Cache entries are deleted on revoke; if the delete failed, the key remains usable for at most the 60s TTL. Inference enforcement itself (`/v1/*`) arrives in a later phase. |
-| Verifying revocation locally | `/v1` auth not yet wired | Check `audit_logs` for `api_key.revoke` rows, list keys via `GET /dashboard/keys` (revoked keys show `revoked_at`), or query Redis (`KEYS *auth:*` patterns) to confirm the entry is gone. |
+| Verifying revocation locally | `/v1` auth not yet wired | Check `audit_logs` for `api_key.revoke` rows, list keys via `GET /dashboard/keys` (revoked keys show `revoked_at`), or query Redis (`KEYS apikey:*`) to confirm the entry is gone. |
 | Password reset needed for a local account | Not yet implemented | Create a second account via `/auth/register`, or (destructive) reset the local DB via `make migrate` after deleting the user row. Do not store plaintext passwords while working around this. |
 
 ### 401 vs 403 quick reference
 
-- **401 Unauthorized** — the request has no valid credentials (missing/expired/malformed JWT, or login failure). Re-authenticate.
-- **403 Forbidden** — credentials are valid but the action is not allowed (e.g. acting on another user's API key). Do not retry with the same token.
+- **401 Unauthorized** — the request has no valid credentials (missing/expired/malformed JWT, login failure, invalid/revoked API key). Re-authenticate.
+- **403 Forbidden** — credentials are valid but the account is suspended on an authenticated route (`user_suspended`). Do not retry with the same token.
 
 ## Data and persistence
 

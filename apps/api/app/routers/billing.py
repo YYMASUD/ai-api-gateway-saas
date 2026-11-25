@@ -1,4 +1,4 @@
-"""Placeholder for billing routes (Phase 4)."""
+"""Placeholder for billing routes (later phase)."""
 
 from fastapi import APIRouter
 

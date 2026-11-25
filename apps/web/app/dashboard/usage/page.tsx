@@ -13,7 +13,7 @@ export default function UsagePage() {
       />
       <PlaceholderPanel title="Usage chart">
         <p>
-          Wire a GET request to <code className="font-mono">/v1/usage</code>{" "}
+          Wire a GET request to <code className="font-mono">/dashboard/usage</code>{" "}
           here once the FastAPI usage endpoint is available. The typed client
           already exposes <code className="font-mono">getUsage()</code>.
         </p>

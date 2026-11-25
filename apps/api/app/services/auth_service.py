@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.core.errors import APIError, AuthenticationError, PermissionDeniedError
+from app.core.errors import APIError, AuthenticationError
 from app.core.logging import get_logger
 from app.core.passwords import (
     hash_password,
@@ -35,19 +35,13 @@ class EmailExistsError(APIError):
 
 
 class InvalidCredentialsError(AuthenticationError):
-    """Unknown email, wrong password, or a non-local account.
+    """Unknown email, wrong password, or a non-active (e.g. suspended) account.
 
     The message is intentionally generic so it never reveals whether the
-    email exists.
+    email exists or why the account cannot log in.
     """
 
     code = "invalid_credentials"
-
-
-class UserSuspendedError(PermissionDeniedError):
-    """A valid password was supplied, but the account is suspended."""
-
-    code = "user_suspended"
 
 
 def _normalise_email(email: str) -> str:
@@ -161,9 +155,9 @@ class AuthService:
         valid = await verify_password_async(password, user.password_hash)
         if not valid:
             raise InvalidCredentialsError("Invalid email or password")
-        if user.status == "suspended":
-            raise UserSuspendedError("Account is suspended")
         if user.status != "active":
+            # Suspended and other non-active accounts must raise the same error
+            # as invalid credentials to avoid leaking account state.
             raise InvalidCredentialsError("Invalid email or password")
         if password_needs_rehash(user.password_hash):
             user.password_hash = await hash_password_async(password)
@@ -194,6 +188,5 @@ __all__ = [
     "EmailExistsError",
     "InvalidCredentialsError",
     "SQLAlchemyAuthRepository",
-    "UserSuspendedError",
     "dummy_password_hash",
 ]

@@ -185,7 +185,7 @@ def _status_to_message(status_code: int) -> str:
 
 def _status_code_to_code(status_code: int) -> str | None:
     if status_code == 401:
-        return "invalid_api_key"
+        return "invalid_token"
     if status_code == 403:
         return "forbidden"
     if status_code == 404:

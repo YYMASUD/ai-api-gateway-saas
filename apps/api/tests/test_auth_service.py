@@ -12,7 +12,6 @@ from app.services.auth_service import (
     AuthService,
     EmailExistsError,
     InvalidCredentialsError,
-    UserSuspendedError,
 )
 from tests.fakes import FakeAuthRepository, make_user
 
@@ -78,15 +77,19 @@ async def test_login_invalid_credentials_is_generic(settings: Settings) -> None:
     assert wrong.value.message == unknown.value.message
 
 
-async def test_login_suspended_user_forbidden(settings: Settings) -> None:
+async def test_login_suspended_user_is_generic_401(settings: Settings) -> None:
     repo = FakeAuthRepository()
     user = make_user(password_hash=hash_password(PASSWORD), status="suspended")
     repo.users[user.id] = user
     service = AuthService(repo, settings)
-    with pytest.raises(UserSuspendedError) as exc:
+    with pytest.raises(InvalidCredentialsError) as suspended:
         await service.login(user.email, PASSWORD)
-    assert exc.value.status_code == 403
-    assert exc.value.code == "user_suspended"
+    with pytest.raises(InvalidCredentialsError) as wrong:
+        await service.login(user.email, "wrong password 123")
+    assert suspended.value.status_code == wrong.value.status_code == 401
+    assert suspended.value.code == wrong.value.code == "invalid_credentials"
+    assert suspended.value.message == wrong.value.message
+    assert user.last_login_at is None
 
 
 async def test_login_without_local_password_rejected(settings: Settings) -> None:

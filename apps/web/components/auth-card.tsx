@@ -32,7 +32,7 @@ export function AuthPlaceholderNotice() {
   return (
     <p className="rounded-md border border-dashed border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
       Password reset is a later-phase placeholder. Email delivery ships in
-      Phase 5; this form is disabled and sends nothing today.
+      a later phase; this form is disabled and sends nothing today.
     </p>
   );
 }

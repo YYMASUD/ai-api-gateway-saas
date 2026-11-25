@@ -1,4 +1,4 @@
-"""Placeholder for the OpenAI-compatible model listing route (Phase 2)."""
+"""Placeholder for the OpenAI-compatible model listing route (later phase)."""
 
 from fastapi import APIRouter
 

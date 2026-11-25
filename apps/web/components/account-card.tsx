@@ -1,10 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ApiError, type AuthUser, createApiClient } from "@/lib/api-client";
+import {
+  type AuthUser,
+  createApiClient,
+  isSessionInvalidError,
+} from "@/lib/api-client";
 import { clearAccessToken, getAccessToken } from "@/lib/auth-token";
 
 type AccountState =
@@ -20,19 +24,34 @@ type AccountState =
  */
 export function AccountCard() {
   const [state, setState] = useState<AccountState>({ status: "loading" });
+  const mountedRef = useRef(true);
+  const loadIdRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     const token = getAccessToken();
+    const loadId = ++loadIdRef.current;
     if (!token) {
-      setState({ status: "signed-out" });
+      if (mountedRef.current) setState({ status: "signed-out" });
       return;
     }
     setState({ status: "loading" });
     try {
       const user = await createApiClient({ token }).me();
+      if (!mountedRef.current || loadIdRef.current !== loadId) return;
       setState({ status: "ready", user });
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 401) {
+      if (!mountedRef.current || loadIdRef.current !== loadId) return;
+      if (isSessionInvalidError(cause)) {
+        // Ignore stale failures: only a request bound to the currently stored
+        // token may clear it, so an old 401 cannot sign out a newer session.
+        if (getAccessToken() !== token) return;
         clearAccessToken();
         setState({ status: "signed-out" });
         return;
@@ -40,7 +59,7 @@ export function AccountCard() {
       setState({
         status: "error",
         message:
-          cause instanceof ApiError
+          cause instanceof Error && cause.message
             ? cause.message
             : "Unable to load account details.",
       });

@@ -1,4 +1,4 @@
-"""Placeholder for the OpenAI-compatible chat completions routes (Phase 2)."""
+"""Placeholder for the OpenAI-compatible chat completions routes (later phase)."""
 
 from fastapi import APIRouter
 

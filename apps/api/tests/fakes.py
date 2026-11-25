@@ -48,6 +48,7 @@ class FakeAPIKeyRepository:
         self.users: dict[uuid.UUID, User] = {}
         self.audits: list[AuditLog] = []
         self.get_by_hash_calls = 0
+        self.flushes = 0
 
     def register_user(self, user: User) -> None:
         self.users[user.id] = user
@@ -72,7 +73,7 @@ class FakeAPIKeyRepository:
         self.audits.append(log)
 
     async def flush(self) -> None:
-        return None
+        self.flushes += 1
 
     async def refresh(self, key: APIKey) -> None:
         return None

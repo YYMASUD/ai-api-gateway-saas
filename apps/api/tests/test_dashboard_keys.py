@@ -153,7 +153,9 @@ def test_revoke_key_owner_only_idempotent_and_audited(app: FastAPI, settings: Se
     }
 
 
-def test_revoke_other_users_key_forbidden(app: FastAPI) -> None:
+def test_revoke_other_users_key_not_found(app: FastAPI) -> None:
+    # A non-owner must get the same 404 as an unknown key so revocation cannot
+    # be used to enumerate other users' key IDs.
     owner = make_user()
     attacker = make_user(email="attacker@example.com")
     repo = FakeAPIKeyRepository()
@@ -163,8 +165,11 @@ def test_revoke_other_users_key_forbidden(app: FastAPI) -> None:
     created = client.post("/dashboard/keys", json={"name": "K"}).json()
     app.dependency_overrides[get_current_user] = lambda: attacker
     response = client.delete(f"/dashboard/keys/{created['id']}")
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "forbidden"
+    unknown = client.delete(f"/dashboard/keys/{uuid.uuid4()}")
+    assert response.status_code == unknown.status_code == 404
+    assert response.json() == unknown.json()
+    assert response.json()["error"]["code"] == "not_found"
+    assert repo.keys[uuid.UUID(created["id"])].revoked_at is None
 
 
 def test_revoke_unknown_key_404(app: FastAPI) -> None:

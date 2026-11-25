@@ -10,7 +10,7 @@ import uuid
 import pytest
 
 from app.config import Settings
-from app.core.errors import AuthenticationError, NotFoundError, PermissionDeniedError
+from app.core.errors import AuthenticationError, NotFoundError
 from app.core.logging import configure_logging
 from app.core.security import hash_api_key
 from app.services.api_key_service import (
@@ -88,9 +88,10 @@ async def test_revoke_requires_ownership(settings: Settings) -> None:
     repo.register_user(other)
     service = APIKeyService(repo, settings, None)
     key, _ = await service.create_key(owner.id, "Mine", ["models:read"])
-    with pytest.raises(PermissionDeniedError) as exc:
+    with pytest.raises(NotFoundError) as exc:
         await service.revoke_key(other.id, key.id)
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 404
+    assert exc.value.code == "not_found"
     assert key.revoked_at is None
 
 
@@ -157,6 +158,36 @@ async def test_authenticate_cache_miss_then_hit(settings: Settings) -> None:
     assert repo.get_by_hash_calls == 1
 
 
+async def test_authenticate_sets_last_used_at_on_db_miss(settings: Settings) -> None:
+    repo = FakeAPIKeyRepository()
+    user = make_user()
+    repo.register_user(user)
+    service = APIKeyService(repo, settings, None)
+    key, raw = await service.create_key(user.id, "K", ["models:read"])
+    assert key.last_used_at is None
+    await service.authenticate(raw)
+    assert key.last_used_at is not None
+    assert repo.flushes == 2  # create_key + authenticate (DB miss)
+
+
+async def test_authenticate_skips_last_used_at_write_on_cache_hit(settings: Settings) -> None:
+    repo = FakeAPIKeyRepository()
+    user = make_user()
+    repo.register_user(user)
+    redis = FakeRedis()
+    service = APIKeyService(repo, settings, redis)
+    key, raw = await service.create_key(user.id, "K", ["models:read"])
+    await service.authenticate(raw)
+    first_used = key.last_used_at
+    assert first_used is not None
+    flushes_after_miss = repo.flushes
+    # Second call is served from the positive cache: no DB lookup or write.
+    await service.authenticate(raw)
+    assert repo.get_by_hash_calls == 1
+    assert repo.flushes == flushes_after_miss
+    assert key.last_used_at == first_used
+
+
 async def test_authenticate_rejects_revoked_key(settings: Settings) -> None:
     repo = FakeAPIKeyRepository()
     user = make_user()
@@ -170,14 +201,19 @@ async def test_authenticate_rejects_revoked_key(settings: Settings) -> None:
 
 
 async def test_authenticate_rejects_suspended_user(settings: Settings) -> None:
+    # A suspended user's key must be indistinguishable from an invalid key.
     repo = FakeAPIKeyRepository()
     user = make_user(status="suspended")
     repo.register_user(user)
     service = APIKeyService(repo, settings, None)
     _, raw = await service.create_key(user.id, "K", ["models:read"])
-    with pytest.raises(PermissionDeniedError) as exc:
+    with pytest.raises(AuthenticationError) as suspended:
         await service.authenticate(raw)
-    assert exc.value.code == "user_suspended"
+    with pytest.raises(AuthenticationError) as unknown:
+        await service.authenticate(generate_api_key(settings.api_key_pepper).raw_key)
+    assert suspended.value.status_code == unknown.value.status_code == 401
+    assert suspended.value.code == unknown.value.code == "invalid_api_key"
+    assert suspended.value.message == unknown.value.message
 
 
 async def test_authenticate_rejects_unknown_and_malformed_keys(settings: Settings) -> None:

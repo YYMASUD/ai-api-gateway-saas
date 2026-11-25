@@ -13,7 +13,7 @@ export default function ResetPage() {
   return (
     <AuthCard
       title="Reset your password"
-      description="A single-use reset link will be emailed once Phase 5 ships email delivery."
+      description="A single-use reset link will be emailed in a later phase."
       footer={<AuthFooterLink prompt="Remembered it?" href="/login" label="Back to sign in" />}
     >
       <form className="flex flex-col gap-4" aria-label="Password reset form">

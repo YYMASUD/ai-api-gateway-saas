@@ -64,6 +64,13 @@ def test_prompt_completion_and_message_content_are_redacted_recursively() -> Non
     assert SENSITIVE not in json.dumps(result)
 
 
+def test_key_hash_is_redacted() -> None:
+    key_hash = "f" * 64
+    result = _process({"event": "api_key_authenticated", "key_hash": key_hash})
+    assert result["key_hash"] == REDACTED
+    assert key_hash not in json.dumps(result)
+
+
 def test_stripe_secrets_in_free_text_are_masked() -> None:
     result = _process({"event": f"stripe callback with whsec_{SENSITIVE}"})
     assert SENSITIVE not in result["event"]

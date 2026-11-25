@@ -95,8 +95,8 @@ export default function DocsPage() {
           </li>
           <li>
             <code className="font-mono">POST /auth/login</code> — exchange
-            credentials for a JWT. Returns 401 on bad credentials, 403 if the
-            account is suspended.
+            credentials for a JWT. Returns a generic 401 for bad credentials or
+            a suspended account (the two are intentionally indistinguishable).
           </li>
           <li>
             <code className="font-mono">GET /auth/me</code> — resolve the

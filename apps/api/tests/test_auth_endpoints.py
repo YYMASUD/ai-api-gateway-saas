@@ -128,14 +128,18 @@ def test_login_short_wrong_password_is_generic_401(app: FastAPI) -> None:
     assert response.json()["error"]["code"] == "invalid_credentials"
 
 
-def test_login_suspended_403(app: FastAPI) -> None:
+def test_login_suspended_is_generic_401(app: FastAPI) -> None:
+    # A valid password for a suspended account must be indistinguishable
+    # from a wrong password (no account-existence/suspension oracle).
     repo = FakeAuthRepository()
     user = make_user(password_hash=hash_password(PASSWORD), status="suspended")
     repo.users[user.id] = user
     client = _client(app, repo)
-    response = client.post("/auth/login", json={"email": user.email, "password": PASSWORD})
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "user_suspended"
+    suspended = client.post("/auth/login", json={"email": user.email, "password": PASSWORD})
+    wrong = client.post("/auth/login", json={"email": user.email, "password": "wrong password 123"})
+    assert suspended.status_code == wrong.status_code == 401
+    assert suspended.json() == wrong.json()
+    assert suspended.json()["error"]["code"] == "invalid_credentials"
 
 
 def test_me_returns_user(app: FastAPI, settings: Settings) -> None:

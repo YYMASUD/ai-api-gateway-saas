@@ -11,7 +11,7 @@ This document describes the intended architecture and marks which parts are actu
 | Service | Runtime | Ports | Responsibility |
 | --- | --- | --- | --- |
 | `web` | Next.js 15 (standalone) | `127.0.0.1:3000` only | Public pages and dashboard shell. Holds no provider keys and no private datastore credentials. |
-| `api` | FastAPI / Python 3.12 | `127.0.0.1:8000` only | Public OpenAI-compatible gateway (planned), dashboard API (planned), health/readiness (implemented), auth/usage/billing orchestration. |
+| `api` | FastAPI / Python 3.12 | `127.0.0.1:8000` only | Public OpenAI-compatible gateway (planned), dashboard API and auth (implemented), health/readiness (implemented), usage/billing orchestration (planned). |
 | `worker` | ARQ / Python 3.12 | none | Private async jobs: usage rollup, credit settlement, webhook processing, reconciliation, email (stubs in Phase 1). |
 | `postgres` | PostgreSQL 16 | none | System of record for users, API keys, credits, usage, payments, webhooks, audit logs, and model pricing. |
 | `redis` | Redis 7 (AOF) | none | Queue backend for ARQ; Phase 2 also uses it for the 60s API-key lookup cache. Rate-limit state comes later. AOF persistence volume is enabled. |
@@ -65,10 +65,10 @@ As of Phase 2, step 2 (key authentication primitives and caching) is implemented
 
 ## Data model (Phase 1 schema)
 
-The initial Alembic revision creates:
+The Phase 1/2 Alembic revisions create:
 
-- `users`: accounts, status, role, optional password hash, Stripe customer id.
-- `api_keys`: name, prefix, `key_hash`, status, timestamps. Raw keys are never stored.
+- `users`: accounts, status, role, optional password hash (added by the `0002_user_password_hash` revision), Stripe customer id.
+- `api_keys`: name, prefix, `key_hash`, scopes, revoked/last-used timestamps. Raw keys are never stored.
 - `credit_ledger`: append-only movements with a signed `amount_microcredits`, a typed `type`, reference, and unique idempotency key.
 - `credit_balances`: available/reserved/lifetime counters with non-negative checks.
 - `usage_events`: per-request user/key/model/token/cost/latency/status with a unique `request_id`.
@@ -134,7 +134,7 @@ Terraform will own networking, managed data services, runtime services, IAM, rem
 
 ## Later-phase TODOs
 
-- Implement and test inference, auth dependencies, billing, and usage ingestion.
+- Implement and test inference (`/v1`) auth wiring, billing, and usage ingestion.
 - Decide whether LiteLLM uses its own database for virtual keys/spend or remains stateless with FastAPI authoritative.
 - Add migrations for any new tables and a backward-compatible migration policy.
 - Add deployment manifests/Terraform, private ingress, TLS, and secret-manager wiring.

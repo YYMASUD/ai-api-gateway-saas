@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.core.errors import AuthenticationError, NotFoundError, PermissionDeniedError
+from app.core.errors import AuthenticationError, NotFoundError
 from app.core.logging import get_logger
 from app.core.security import hash_api_key
 from app.db.models import APIKey, AuditLog, User
@@ -265,7 +265,9 @@ class APIKeyService:
         if key is None:
             raise NotFoundError("API key not found")
         if key.user_id != user_id:
-            raise PermissionDeniedError("You do not have access to this API key", code="forbidden")
+            # Non-owners must see the same response as callers probing unknown
+            # keys, otherwise revocation can be used to enumerate key IDs.
+            raise NotFoundError("API key not found")
         if key.revoked_at is None:
             now = datetime.now(UTC)
             key.revoked_at = now
@@ -296,8 +298,10 @@ class APIKeyService:
     async def authenticate(self, raw_key: str) -> APIKeyPrincipal:
         """Verify an API key, using a positive 60s Redis cache when available.
 
-        Redis failures fail open to the database; cache problems never break
-        authentication and never log secrets.
+        ``last_used_at`` is written only on cache misses, so its granularity
+        is approximately the 60s cache TTL. Redis failures fail open to the
+        database; cache problems never break authentication and never log
+        secrets.
         """
         if not isinstance(raw_key, str) or not raw_key.startswith(_KEY_FORMAT_PREFIX):
             raise self._invalid_key()
@@ -327,9 +331,16 @@ class APIKeyService:
         if key.revoked_at is not None:
             raise self._invalid_key()
         if user.status == "suspended":
-            raise PermissionDeniedError("Account is suspended", code="user_suspended")
+            # Suspended users must be indistinguishable from invalid/revoked keys
+            # to avoid leaking account existence and suspension state.
+            raise self._invalid_key()
         if user.status != "active":
             raise self._invalid_key()
+        # Record activity only on DB misses; cached requests deliberately skip
+        # both this write and the repository lookup. Granularity is therefore
+        # approximately the positive principal cache TTL.
+        key.last_used_at = datetime.now(UTC)
+        await self._repository.flush()
         principal = APIKeyPrincipal(
             user_id=str(user.id),
             api_key_id=str(key.id),

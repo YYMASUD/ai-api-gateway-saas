@@ -5,7 +5,7 @@
 This document describes the FastAPI gateway's HTTP surface.
 
 - **Phase 1** implements health/readiness probes and the OpenAI-compatible error envelope.
-- **Phase 2** implements self-built email/password authentication (`/auth/*`) and API-key lifecycle management (`/dashboard/keys*`), both protected by HS256 JWTs.
+- **Phase 2** implements self-built email/password authentication (`/auth/*`) and API-key lifecycle management (`/dashboard/keys*`); `/auth/me` and `/dashboard/keys*` are protected by HS256 JWTs, while `/auth/register` and `/auth/login` are public.
 - **Later phases** add inference (`/v1/*`), billing/webhooks (`/billing/*`, `/webhooks/*`), usage data, and admin tooling. These are documented as *planned* and are not implemented yet.
 
 ## Base URLs
@@ -55,10 +55,10 @@ All errors follow the OpenAI-compatible shape, regardless of the route:
 | --- | --- | --- |
 | 400 | `invalid_request_error` | (varies) |
 | 401 | `authentication_error` | `invalid_api_key` / `invalid_credentials` / `invalid_token` |
-| 403 | `permission_error` | `forbidden` / `insufficient_scope` |
+| 403 | `permission_error` | `forbidden` / `user_suspended` (`insufficient_scope` arrives with /v1 scope enforcement) |
 | 404 | `invalid_request_error` | `not_found` |
 | 405 | `invalid_request_error` | `method_not_allowed` |
-| 409 | `invalid_request_error` | `conflict` (e.g. email already registered) |
+| 409 | `invalid_request_error` | `email_exists` (email already registered) |
 | 422 | `invalid_request_error` | `invalid_request` (with `param` location) |
 | 429 | `rate_limit_error` | `rate_limit_exceeded` |
 | 502 | `api_error` | `upstream_error` |
@@ -196,8 +196,10 @@ Authenticate and receive a JWT access token.
 | Status | Meaning |
 | --- | --- |
 | 200 | Login successful; JWT issued |
-| 401 | Invalid credentials (generic response; does not distinguish email-not-found vs wrong-password) |
+| 401 | Invalid credentials (generic response; does not distinguish unknown email, wrong password, or suspended account) |
 | 422 | Validation error (missing or malformed fields) |
+
+Suspended accounts receive the same generic `401` on login; `403 user_suspended` is only returned on already-authenticated routes such as `GET /auth/me`.
 
 The JWT contains `sub` (user ID), `exp`, `iss`, and `aud` claims. The `expires_in` value is in seconds and matches `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` (default 60 minutes, range 5–1440).
 
@@ -228,6 +230,7 @@ Retrieve the authenticated user's profile.
 | --- | --- |
 | 200 | Authenticated user returned |
 | 401 | Missing or invalid JWT |
+| 403 | The authenticated account is suspended (`user_suspended`) |
 
 ### Dashboard API keys
 
@@ -302,11 +305,13 @@ Create a new API key. The raw key is returned **exactly once** in the response a
 
 **Key format:** `sk_live_` prefix followed by base62-encoded random material generated from 32 cryptographically random bytes. The stored `key_hash` is `SHA-256(raw_key + API_KEY_PEPPER)`, hex-encoded; the raw key is never persisted. The `prefix` column stores the first 8 characters of the random part; the API renders it as `sk_live_XXXXXXXX` for display.
 
-**Scopes:** Currently supported scopes are `chat:completions` and `models:read`. At least one scope is required.
+**Scopes:** Currently supported scopes are `chat:completions` and `models:read`. The field is optional and defaults to both scopes; an explicit list must contain at least one known scope (max 2, duplicates deduplicated).
 
 **Redis lookup cache:** API-key lookups are cached in Redis for 60 seconds. Revocation deletes the entry immediately (see below). The cache backs the API-key auth dependency; the `/v1/*` inference routes that consume it arrive in a later phase.
 
 **Audit log:** Key creation is recorded in `audit_logs` with actor, action (`api_key.create`), and resource ID. The raw key and hash are never logged.
+
+`last_used_at` is updated when an API key authenticates and the lookup misses the Redis cache; with the 60-second positive cache, its effective granularity is approximately 60 seconds.
 
 #### `DELETE /dashboard/keys/{id}`
 
@@ -320,10 +325,9 @@ Revoke an API key.
 
 | Status | Meaning |
 | --- | --- |
-| 204 | Key revoked successfully |
+| 204 | Key revoked successfully (or already revoked) |
 | 401 | Missing or invalid JWT |
-| 403 | Key does not belong to the authenticated user |
-| 404 | Key not found |
+| 404 | Key not found, or it belongs to another user (existence is not revealed) |
 
 **Revocation behavior:** The `revoked_at` timestamp is set on the `api_keys` row and the Redis cache entry for the key hash is deleted immediately, so the key stops authenticating on the next request. If the cache delete fails, the key remains usable for at most the 60-second cache TTL (stale-but-bounded). Revocation is idempotent at the data level; revoking an already-revoked key is a no-op that still returns `204`.
 
@@ -331,7 +335,7 @@ Revoke an API key.
 
 ## Planned endpoints (later phases)
 
-These routes are registered but currently return placeholder responses. They are listed here so clients can be shaped against a stable contract.
+These routes are not registered yet and currently return `404 not_found`; their routers exist as empty placeholders. They are listed here so clients can be shaped against a stable contract.
 
 ### OpenAI-compatible inference
 

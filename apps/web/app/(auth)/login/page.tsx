@@ -2,12 +2,12 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { AuthCard, AuthFooterLink } from "@/components/auth-card";
 import { Button } from "@/components/ui/button";
 import { ApiError, createApiClient } from "@/lib/api-client";
-import { setAccessToken } from "@/lib/auth-token";
+import { clearAccessToken, setAccessToken } from "@/lib/auth-token";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -15,25 +15,45 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Stale-response guards: only the newest submit may store a token or
+  // navigate, and no async result may touch state after unmount.
+  const submitIdRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const submitId = ++submitIdRef.current;
     setError(null);
+    // A failed attempt must not leave a previous session's token alive.
+    clearAccessToken();
     setLoading(true);
 
     try {
       const client = createApiClient();
       const response = await client.login({ email, password });
+      if (!mountedRef.current || submitIdRef.current !== submitId) return;
+      // Never store an unvalidated token; that would redirect into a 401 loop.
+      if (
+        typeof response?.access_token !== "string" ||
+        response.access_token.length === 0
+      ) {
+        setError("Sign in failed. Please try again.");
+        return;
+      }
       setAccessToken(response.access_token);
       router.push("/dashboard/keys");
     } catch (cause) {
+      if (!mountedRef.current || submitIdRef.current !== submitId) return;
       if (cause instanceof ApiError) {
         if (cause.status === 401) {
           setError("Invalid email or password. Please try again.");
-        } else if (cause.status === 403) {
-          setError(
-            "This account has been suspended. Contact support if you believe this is a mistake.",
-          );
         } else {
           setError(cause.message || "Sign in failed. Please try again.");
         }
@@ -41,7 +61,9 @@ export default function LoginPage() {
         setError("Network error. Please check your connection and retry.");
       }
     } finally {
-      setLoading(false);
+      if (mountedRef.current && submitIdRef.current === submitId) {
+        setLoading(false);
+      }
     }
   }
 

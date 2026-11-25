@@ -1,16 +1,22 @@
 "use client";
 
 import Link from "next/link";
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import {
-  ApiError,
   type ApiKey,
   type AuthUser,
   type CreatedApiKey,
   createApiClient,
+  isSessionInvalidError,
 } from "@/lib/api-client";
 import { clearAccessToken, getAccessToken } from "@/lib/auth-token";
 
@@ -45,16 +51,43 @@ export default function KeysPage() {
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [revokeError, setRevokeError] = useState<string | null>(null);
 
-  const showSignedOut = useCallback(() => {
-    clearAccessToken();
+  // Stale-response guards: ignore async results after unmount, and never let a
+  // slower load overwrite a newer one.
+  const mountedRef = useRef(true);
+  const loadIdRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const signedOut = useCallback(() => {
     setFreshKey(null);
     setView({ status: "unauthenticated", user: null, keys: [], error: null });
   }, []);
 
+  /**
+   * Handle a 401/403 for a request bound to `capturedToken`. Only clear when
+   * the stored token is still that token, so an old request's failure cannot
+   * sign out a newer session.
+   */
+  const handleSessionFailure = useCallback(
+    (capturedToken: string) => {
+      if (getAccessToken() !== capturedToken) return;
+      clearAccessToken();
+      if (!mountedRef.current) return;
+      signedOut();
+    },
+    [signedOut],
+  );
+
   const load = useCallback(async () => {
     const token = getAccessToken();
+    const loadId = ++loadIdRef.current;
     if (!token) {
-      setView({ status: "unauthenticated", user: null, keys: [], error: null });
+      if (mountedRef.current) signedOut();
       return;
     }
 
@@ -62,22 +95,24 @@ export default function KeysPage() {
     try {
       const client = createApiClient({ token });
       const [user, keys] = await Promise.all([client.me(), client.listKeys()]);
+      if (!mountedRef.current || loadIdRef.current !== loadId) return;
       setView({ status: "ready", user, keys, error: null });
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 401) {
-        showSignedOut();
+      if (!mountedRef.current || loadIdRef.current !== loadId) return;
+      if (isSessionInvalidError(cause)) {
+        handleSessionFailure(token);
         return;
       }
       setView((prev) => ({
         ...prev,
         status: "error",
         error:
-          cause instanceof ApiError
+          cause instanceof Error && cause.message
             ? cause.message
             : "Unable to load API keys right now.",
       }));
     }
-  }, [showSignedOut]);
+  }, [handleSessionFailure, signedOut]);
 
   useEffect(() => {
     void load();
@@ -87,7 +122,12 @@ export default function KeysPage() {
     event.preventDefault();
     const token = getAccessToken();
     if (!token) {
-      showSignedOut();
+      signedOut();
+      return;
+    }
+    // Never omit scopes: the API would fall back to a fully-scoped key.
+    if (selectedScopes.length === 0) {
+      setCreateError("Select at least one scope.");
       return;
     }
 
@@ -99,23 +139,26 @@ export default function KeysPage() {
       const client = createApiClient({ token });
       const created = await client.createKey({
         name: newKeyName.trim(),
-        scopes: selectedScopes.length ? selectedScopes : undefined,
+        scopes: selectedScopes,
       });
+      if (!mountedRef.current) return;
+      if (getAccessToken() !== token) return;
       setFreshKey(created);
       setNewKeyName("");
       await load();
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 401) {
-        showSignedOut();
+      if (!mountedRef.current) return;
+      if (isSessionInvalidError(cause)) {
+        handleSessionFailure(token);
         return;
       }
       setCreateError(
-        cause instanceof ApiError
+        cause instanceof Error && cause.message
           ? cause.message
           : "Could not create key. Please try again.",
       );
     } finally {
-      setCreating(false);
+      if (mountedRef.current) setCreating(false);
     }
   }
 
@@ -129,7 +172,7 @@ export default function KeysPage() {
 
     const token = getAccessToken();
     if (!token) {
-      showSignedOut();
+      signedOut();
       return;
     }
 
@@ -138,19 +181,21 @@ export default function KeysPage() {
     try {
       const client = createApiClient({ token });
       await client.revokeKey(apiKey.id);
+      if (!mountedRef.current || getAccessToken() !== token) return;
       await load();
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 401) {
-        showSignedOut();
+      if (!mountedRef.current) return;
+      if (isSessionInvalidError(cause)) {
+        handleSessionFailure(token);
         return;
       }
       setRevokeError(
-        cause instanceof ApiError
+        cause instanceof Error && cause.message
           ? cause.message
           : "Failed to revoke key. Please try again.",
       );
     } finally {
-      setRevokingId(null);
+      if (mountedRef.current) setRevokingId(null);
     }
   }
 
@@ -158,9 +203,9 @@ export default function KeysPage() {
     if (!freshKey) return;
     try {
       await navigator.clipboard.writeText(freshKey.key);
-      setCopyState("copied");
+      if (mountedRef.current) setCopyState("copied");
     } catch {
-      setCopyState("failed");
+      if (mountedRef.current) setCopyState("failed");
     }
   }
 
@@ -199,6 +244,8 @@ export default function KeysPage() {
       </>
     );
   }
+
+  const scopesMissing = selectedScopes.length === 0;
 
   return (
     <>
@@ -290,12 +337,16 @@ export default function KeysPage() {
                   name="key-name"
                   type="text"
                   required
+                  maxLength={64}
                   value={newKeyName}
                   onChange={(event) => setNewKeyName(event.target.value)}
                   placeholder="Production backend"
                   className="h-10 rounded-md border border-input bg-background px-3 text-sm"
                   disabled={creating}
                 />
+                <p className="text-xs text-muted-foreground">
+                  Up to 64 characters.
+                </p>
               </div>
               <fieldset className="flex flex-col gap-2">
                 <legend className="text-sm font-medium">Scopes</legend>
@@ -311,13 +362,21 @@ export default function KeysPage() {
                     <span className="font-mono text-xs">{scope}</span>
                   </label>
                 ))}
+                {scopesMissing ? (
+                  <p className="text-xs text-destructive">
+                    Select at least one scope.
+                  </p>
+                ) : null}
               </fieldset>
               {createError ? (
                 <p role="alert" className="text-sm text-destructive">
                   {createError}
                 </p>
               ) : null}
-              <Button type="submit" disabled={creating || !newKeyName.trim()}>
+              <Button
+                type="submit"
+                disabled={creating || !newKeyName.trim() || scopesMissing}
+              >
                 {creating ? "Creating…" : "Create key"}
               </Button>
             </form>

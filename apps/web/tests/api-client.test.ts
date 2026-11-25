@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   createApiClient,
+  isSessionInvalidError,
   joinUrl,
   resolveApiBaseUrl,
 } from "@/lib/api-client";
@@ -137,8 +138,8 @@ describe("createApiClient", () => {
     expect(urls).toEqual([
       "http://localhost:8000/v1/models",
       "http://localhost:8000/dashboard/keys",
-      "http://localhost:8000/v1/billing/summary",
-      "http://localhost:8000/v1/usage",
+      "http://localhost:8000/dashboard/billing",
+      "http://localhost:8000/dashboard/usage",
     ]);
   });
 
@@ -376,5 +377,85 @@ describe("createApiClient", () => {
     });
 
     await expect(client.health()).rejects.toThrow(/timed out after 5ms/);
+  });
+
+  it("times out when headers arrive but the response body stalls", async () => {
+    const fetchImpl = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        Promise.resolve({
+          status: 200,
+          ok: true,
+          headers: new Headers({ "content-type": "application/json" }),
+          // Headers resolve, but the body never completes on its own.
+          json: () =>
+            new Promise((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                const error = new Error("aborted");
+                error.name = "AbortError";
+                reject(error);
+              });
+            }),
+        } as unknown as Response),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 5,
+    });
+
+    await expect(client.health()).rejects.toThrow(/timed out after 5ms/);
+  });
+
+  it("labels a caller abort as cancellation, not a timeout", async () => {
+    const caller = new AbortController();
+    const fetchImpl = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        }),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 60_000,
+    });
+
+    const pending = client.request("/healthz", { signal: caller.signal });
+    caller.abort();
+
+    await expect(pending).rejects.toThrow(/was cancelled/);
+    await expect(pending).rejects.not.toThrow(/timed out/i);
+  });
+
+  it("removes the caller abort listener after the request settles", async () => {
+    const caller = new AbortController();
+    const removeSpy = vi.spyOn(caller.signal, "removeEventListener");
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse({ status: "ok" }),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await client.request("/healthz", { signal: caller.signal });
+
+    expect(removeSpy).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("classifies 401, 403, and user_suspended as invalid sessions", () => {
+    const build = (status: number, code: string | null = null) =>
+      new ApiError("x", status, null, { code });
+
+    expect(isSessionInvalidError(build(401))).toBe(true);
+    expect(isSessionInvalidError(build(403))).toBe(true);
+    expect(isSessionInvalidError(build(403, "user_suspended"))).toBe(true);
+    expect(isSessionInvalidError(build(429))).toBe(false);
+    expect(isSessionInvalidError(new Error("boom"))).toBe(false);
   });
 });
