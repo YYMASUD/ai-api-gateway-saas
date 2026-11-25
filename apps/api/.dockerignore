@@ -1,0 +1,19 @@
+# Keep the build context lean and never ship local artifacts or secrets.
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+.env.*
+*.egg-info/
+build/
+dist/
+tests/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

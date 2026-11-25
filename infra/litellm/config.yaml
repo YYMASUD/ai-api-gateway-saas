@@ -1,0 +1,56 @@
+# LiteLLM proxy configuration (Phase 1 skeleton).
+#
+# Security rules:
+#   * No provider credentials are stored here. Upstream keys are injected into
+#     the litellm container from the platform secrets manager at runtime and
+#     referenced with `os.environ/<NAME>` (see the example below).
+#   * The proxy is private-network only. Only FastAPI calls it, using
+#     LITELLM_MASTER_KEY; the browser never receives that key.
+#   * Provider/model choices are intentionally not made in Phase 1. Populate the
+#     model list when a provider contract is approved.
+
+model_list: []
+# Example shape only -- replace with approved providers and secret-managed names:
+#
+# model_list:
+#   - model_name: "<public-alias>"
+#     litellm_params:
+#       model: "<provider>/<model-id>"
+#       api_key: "os.environ/<PROVIDER_API_KEY_ENV>"
+#       api_base: "os.environ/<PROVIDER_API_BASE_ENV>"  # only if the provider needs it
+#     model_info:
+#       mode: chat
+#       # Optional per-deployment limits, used for routing/cost controls later.
+#       # rpm: <int>
+#       # tpm: <int>
+
+litellm_settings:
+  # Conservative defaults; tune per provider in a later phase.
+  request_timeout: 60
+  num_retries: 2
+  drop_params: true
+  # Fallback pairs go here once at least two model groups exist, for example:
+  # fallbacks:
+  #   - "<primary-model-group>": ["<fallback-model-group>"]
+  # context_window_fallbacks:
+  #   - "<primary-model-group>": ["<larger-context-model-group>"]
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  timeout: 60
+  allowed_fails: 3
+  cooldown_time: 30
+  # Redis-backed routing state is optional in Phase 1. Enable only when more
+  # than one LiteLLM replica runs:
+  # redis_host: os.environ/REDIS_HOST
+  # redis_port: os.environ/REDIS_PORT
+  # redis_password: os.environ/REDIS_PASSWORD
+
+general_settings:
+  # Master key is read from the container environment only, never inline.
+  master_key: os.environ/LITELLM_MASTER_KEY
+  # The gateway's own PostgreSQL is authoritative for billing and metering.
+  # LiteLLM's optional database/UI features stay disabled in Phase 1.
+  # store_model_in_db: false
+  # database_url: os.environ/LITELLM_DATABASE_URL

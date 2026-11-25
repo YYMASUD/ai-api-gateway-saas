@@ -1,0 +1,21 @@
+# Basic gitleaks configuration: extend the built-in rules and allowlist only
+# obvious placeholder/lockfile paths. Keep allowlists narrow so real secrets
+# accidentally committed to docs, compose, or infra files are still detected.
+title = "AI API Gateway SaaS gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Blank-by-design environment template"
+paths = ['''(^|/)\.env\.example$''']
+
+[[allowlists]]
+description = "Dependency lockfiles (integrity hashes are not secrets)"
+paths = [
+  '''(^|/)package-lock\.json$''',
+  '''(^|/)pnpm-lock\.ya?ml$''',
+  '''(^|/)yarn\.lock$''',
+  '''(^|/)poetry\.lock$''',
+  '''(^|/)uv\.lock$''',
+]

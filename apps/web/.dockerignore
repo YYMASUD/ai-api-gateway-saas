@@ -1,0 +1,15 @@
+node_modules
+.next
+.git
+.gitignore
+Dockerfile
+.dockerignore
+npm-debug.log*
+README.md
+coverage
+playwright-report
+test-results
+tests
+.env
+.env.*
+!.env.example

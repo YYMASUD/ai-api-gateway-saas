@@ -1,0 +1,14 @@
+# Placeholder alert rules (Phase 1). No routing/credentials configured yet.
+groups: []
+# Example shape only:
+#
+# groups:
+#   - name: ai-api-gateway-saas
+#     rules:
+#       - alert: ApiDown
+#         expr: up{job="api"} == 0
+#         for: 5m
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "API target is down"

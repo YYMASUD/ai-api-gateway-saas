@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools==75.8.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-api-gateway-worker"
+version = "0.1.0"
+description = "Private background worker skeleton for the AI API gateway."
+requires-python = "==3.12.*"
+dependencies = [
+  "arq==0.28.0",
+  "httpx==0.28.1",
+  "pydantic==2.14.4",
+  "pydantic-settings==2.16.3",
+  # redis-py is published under the "redis" distribution name.
+  "redis==5.3.1",
+  "structlog==26.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==2.4.1",
+  "pytest==9.2.0",
+  "pytest-asyncio==1.5.0",
+  "pytest-cov==7.1.0",
+  "ruff==0.17.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-markers --strict-config"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["."]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["app", "tests"]
+strict = true
+show_error_codes = true
+pretty = true

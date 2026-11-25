@@ -1,0 +1,74 @@
+# Build and dependency directories are rebuilt inside images.
+node_modules
+**/node_modules
+.venv
+**/.venv
+venv
+**/venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+**/*.egg-info
+.next
+**/.next
+out
+**/out
+dist
+**/dist
+
+# Version control and local metadata
+.git
+.gitignore
+.dockerignore
+
+# Environment files and credentials: never sent to the Docker daemon.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets
+**/secrets
+
+# Caches and coverage
+.pytest_cache
+**/.pytest_cache
+.mypy_cache
+**/.mypy_cache
+.ruff_cache
+**/.ruff_cache
+.turbo
+**/.turbo
+coverage
+coverage.*
+**/coverage
+**/htmlcov
+**/.coverage
+**/.coverage.*
+
+# Tests and local artifacts
+test-results
+**/test-results
+playwright-report
+**/playwright-report
+**/blob-report
+**/playwright/.cache
+tmp
+**/tmp
+logs
+**/logs
+
+# Editors and OS noise
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Infrastructure state must never enter images.
+infra/terraform/.terraform
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/*.tfplan

@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars locally and do not commit it. Prefer CI-injected
+# variables and remote state. Never put secret values in tfvars.
+project_name = "ai-api-gateway-saas"
+environment  = "staging"
+
+tags = {
+  owner = ""
+}

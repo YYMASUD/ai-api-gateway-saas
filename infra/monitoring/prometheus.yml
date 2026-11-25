@@ -1,0 +1,19 @@
+# Placeholder Prometheus scrape configuration (Phase 1).
+#
+# Not loaded by docker-compose yet. Fill in private service addresses in the
+# observability phase. These are internal DNS names, never public endpoints.
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs: []
+# Example shape only:
+#
+# scrape_configs:
+#   - job_name: "api"
+#     metrics_path: "/metrics"
+#     static_configs:
+#       - targets: ["api:8000"]
+#   - job_name: "litellm"
+#     static_configs:
+#       - targets: ["litellm:4000"]
