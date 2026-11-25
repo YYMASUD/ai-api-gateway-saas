@@ -77,7 +77,7 @@ openssl rand -hex 24   # POSTGRES_PASSWORD / REDIS_PASSWORD
 5. Add secret-manager injection and rotation runbooks; rotate any value that may have been exposed.
 6. Enable metrics, traces, alerting, and retention with defined SLOs/on-call ownership.
 7. Harden CSP with a nonce/hash strategy so `script-src 'unsafe-inline'` can be removed.
-8. Pin all third-party images by digest (LiteLLM is pinned; Postgres/Redis tags should also be pinned) and scan images.
+8. Pin all third-party images by digest (LiteLLM is pinned; Postgres/Redis tags should also be pinned) and scan images. Run containers with `read_only: true`, `cap_drop: ALL`, and `security_opt: ["no-new-privileges:true"]` where the image allows it; these are documented production requirements and are not set on the local dev stack.
 9. Add dependency lockfiles/SBOMs, automated patch PRs, and release signing.
 10. Perform an external security review and dependency/container scan before launch.
 

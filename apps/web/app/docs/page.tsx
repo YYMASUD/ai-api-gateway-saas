@@ -6,7 +6,9 @@ export const metadata: Metadata = { title: "API documentation" };
 
 const openAiExample = `// Server-side example: keep credentials out of the browser bundle.
 const baseUrl =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+  process.env.API_INTERNAL_URL ??
+  process.env.NEXT_PUBLIC_API_BASE_URL ??
+  "http://localhost:8000";
 
 const response = await fetch(\`\${baseUrl}/v1/chat/completions\`, {
   method: "POST",
@@ -41,6 +43,14 @@ export default function DocsPage() {
           for local development. Credentials are read from a server-only
           environment variable; never paste a key into source code or client
           components.
+        </p>
+        <p
+          role="note"
+          className="max-w-2xl rounded-lg border border-border bg-muted/40 p-4 text-sm text-muted-foreground"
+        >
+          <code className="font-mono">NEXT_PUBLIC_*</code> values are public and
+          are bundled into the browser, so they must never contain credentials.
+          Keep <code className="font-mono">GATEWAY_API_KEY</code> server-only.
         </p>
         <pre className="overflow-x-auto rounded-lg border border-border bg-muted/40 p-4 text-sm">
           <code>{openAiExample}</code>

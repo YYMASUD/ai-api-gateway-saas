@@ -92,6 +92,18 @@ jobs:
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
 
+      - name: Reject insecure lockfile registries
+        # The lockfile must resolve over HTTPS from the canonical npm registry.
+        run: |
+          if grep -Eq '"resolved": "http://' package-lock.json; then
+            echo "ERROR: package-lock.json contains insecure http:// resolved URLs" >&2
+            exit 1
+          fi
+          if grep -E '"resolved":' package-lock.json | grep -vEq '"resolved": "https://registry\.npmjs\.org/'; then
+            echo "ERROR: package-lock.json resolves packages from a non-canonical registry" >&2
+            exit 1
+          fi
+
       - name: Install
         run: npm ci
 

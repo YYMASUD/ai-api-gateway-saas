@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import structlog
 
 from app.core.logging import REDACTED, configure_logging, redact_sensitive_data, redact_value
 
 SENSITIVE = "SENSITIVE-VALUE-MUST-NOT-APPEAR"
+
+FAKE_SECRET_VALUES = [
+    "sk-abcdefghijklmnopqrstuvwxyz123456",
+    "sk_live_" + "fakekey1234567890",
+    "whsec_fakesecret1234567890",
+    "Bearer fake-bearer-token-1234567890",
+    (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiJmYWtlLXVzZXIiLCJyb2xlIjoidGVzdCJ9."
+        "ZmFrZS1zaWduYXR1cmUtMTIzNDU2Nzg5MA"
+    ),
+]
 
 
 def _process(event: dict) -> dict:
@@ -78,3 +91,17 @@ def test_original_mapping_is_not_mutated() -> None:
     original = {"prompt": SENSITIVE, "status": "ok"}
     redact_value(original)
     assert original == {"prompt": SENSITIVE, "status": "ok"}
+
+
+@pytest.mark.parametrize("secret", FAKE_SECRET_VALUES)
+def test_value_level_redaction_of_credential_shapes(secret: str) -> None:
+    result = _process({"event": "upstream response", "detail": f"received {secret} from caller"})
+    assert secret not in result["detail"]
+    assert REDACTED in result["detail"]
+
+
+@pytest.mark.parametrize("secret", FAKE_SECRET_VALUES)
+def test_value_level_redaction_nested_in_plain_values(secret: str) -> None:
+    result = redact_value({"note": [f"token={secret}"], "safe": "keep-me"})
+    assert secret not in json.dumps(result)
+    assert result["safe"] == "keep-me"

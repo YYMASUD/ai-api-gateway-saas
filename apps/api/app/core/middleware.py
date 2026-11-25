@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 
 import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp
@@ -59,8 +60,6 @@ class DashboardCORSMiddleware:
 
     def __init__(self, app: ASGIApp, allow_origins: list[str]) -> None:
         self.app = app
-        from starlette.middleware.cors import CORSMiddleware
-
         self._cors = CORSMiddleware(
             app,
             allow_origins=allow_origins,

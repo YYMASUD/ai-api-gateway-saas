@@ -32,7 +32,7 @@ python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
 pytest
-uvicorn app.main:app --reload
+uvicorn app.main:create_app --factory --reload
 ```
 
 ## Migrations

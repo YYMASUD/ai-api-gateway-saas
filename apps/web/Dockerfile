@@ -32,6 +32,8 @@ RUN addgroup --system --gid 1001 nodejs \
 # `output: "standalone"` emits a self-contained server plus static assets.
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+# `public/` holds static assets served as-is; without it those paths 404.
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 USER nextjs
 EXPOSE 3000

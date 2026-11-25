@@ -37,4 +37,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 # Trust proxy headers only from the explicitly configured ingress address(es).
 # Set FORWARDED_ALLOW_IPS to the ingress CIDR in production; never use '*'.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers ${WORKERS} --no-server-header --proxy-headers --forwarded-allow-ips=${FORWARDED_ALLOW_IPS}"]
+CMD ["sh", "-c", "exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port ${PORT} --workers ${WORKERS} --no-server-header --proxy-headers --forwarded-allow-ips=${FORWARDED_ALLOW_IPS}"]

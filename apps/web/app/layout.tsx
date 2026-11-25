@@ -23,6 +23,9 @@ const navLinks = [
   { href: "/admin", label: "Admin" },
 ];
 
+const apiBaseUrl =
+  process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "http://localhost:8000";
+
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
@@ -57,7 +60,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <main className="container flex-1 py-10">{children}</main>
         <footer className="border-t border-border/70 py-6">
           <p className="container text-sm text-muted-foreground">
-            Phase 1 scaffold — local default gateway at http://localhost:8000
+            Phase 1 scaffold — gateway base URL at {apiBaseUrl}
           </p>
         </footer>
       </body>

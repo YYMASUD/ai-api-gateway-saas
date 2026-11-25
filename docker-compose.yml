@@ -26,6 +26,8 @@ services:
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
       API_INTERNAL_URL: ${API_INTERNAL_URL:-http://api:8000}
+      # Server-only credential for future Next.js route handlers; never public.
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-}
       SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-}
@@ -60,8 +62,8 @@ services:
       # pydantic-settings reads `environment` from ENVIRONMENT.
       ENVIRONMENT: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      APP_URL: http://localhost:3000
-      API_BASE_URL: http://localhost:8000
+      APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
       LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://litellm:4000}
@@ -175,7 +177,8 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"
+        # Pass the password via REDISCLI_AUTH so it is not exposed in argv.
+        - "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli --no-auth-warning ping | grep -q PONG"
       interval: 5s
       timeout: 3s
       retries: 10

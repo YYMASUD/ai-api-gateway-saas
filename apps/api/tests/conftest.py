@@ -6,7 +6,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from app.config import Settings
+from app.config import Settings, get_settings
 
 TEST_ENV = {
     "ENVIRONMENT": "test",
@@ -27,7 +27,13 @@ TEST_ENV = {
 def env(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, str]]:
     for key, value in TEST_ENV.items():
         monkeypatch.setenv(key, value)
-    yield dict(TEST_ENV)
+    # Drop any settings memoised before the environment was set, and again
+    # afterwards, so stale settings never leak between tests.
+    get_settings.cache_clear()
+    try:
+        yield dict(TEST_ENV)
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.fixture

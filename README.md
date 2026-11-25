@@ -158,6 +158,8 @@ mypy app
 
 The web build reads `NEXT_PUBLIC_API_BASE_URL` at build time; it must be a public origin, never a credential. The local default is `http://localhost:8000`.
 
+`apps/web/.npmrc` pins installs to `https://registry.npmjs.org/`, and CI rejects any `http://` or non-canonical `"resolved"` URL in `package-lock.json` before running `npm ci`.
+
 ## Phase 1 status
 
 Implemented in this milestone:

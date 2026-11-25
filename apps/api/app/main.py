@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
@@ -19,19 +20,31 @@ from app.routers import admin, billing, dashboard, health, v1_chat, v1_models, w
 logger = get_logger(__name__)
 
 
+_READINESS_TIMEOUT_SECONDS = 5.0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise and tear down shared resources."""
     settings: Settings = app.state.settings
-    configure_logging(settings.log_level)
     await database_state.init(settings)
     redis_client: Redis = create_redis_client(settings)
     app.state.redis = redis_client
+    # One shared client for readiness probes; closed exactly once on shutdown.
+    litellm_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(_READINESS_TIMEOUT_SECONDS, connect=2.0)
+    )
+    app.state.litellm_client = litellm_client
     logger.info("gateway_started", environment=settings.environment)
     try:
         yield
     finally:
-        await redis_client.aclose()
+        # Close each resource independently so one failure cannot skip the rest.
+        for resource in (litellm_client, redis_client):
+            try:
+                await resource.aclose()
+            except Exception:
+                logger.warning("lifespan_cleanup_failed", resource=type(resource).__name__)
         await database_state.dispose()
         logger.info("gateway_stopped")
 
@@ -67,6 +80,4 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
-
-__all__ = ["app", "create_app", "lifespan"]
+__all__ = ["create_app", "lifespan"]
