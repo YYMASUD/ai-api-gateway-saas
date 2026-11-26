@@ -136,10 +136,15 @@ export default function DocsPage() {
           Typed client surface
         </h2>
         <p className="max-w-2xl text-sm text-muted-foreground">
-          Phase 1 implements gateway liveness at{" "}
-          <code className="font-mono">GET /healthz</code>. Phase 2 adds auth
-          and key management. Billing and usage remain later-phase placeholders:
-          their paths are reserved, but the gateway does not serve them yet.
+          Phase 1 ships gateway liveness at{" "}
+          <code className="font-mono">GET /healthz</code>. Phase 2 implements
+          auth and key management. Phase 3 adds owner-only credit balance and
+          ledger endpoints. Phase 4 adds the OpenAI-compatible surface:{" "}
+          <code className="font-mono">GET /v1/models</code> and{" "}
+          <code className="font-mono">POST /v1/chat/completions</code>, the
+          latter supporting both streaming and non-streaming responses. Billing
+          and usage remain later-phase placeholders: their paths are reserved,
+          but the gateway does not serve them yet.
         </p>
         <ul className="grid gap-3 text-sm text-muted-foreground sm:grid-cols-2">
           <li>
@@ -147,15 +152,22 @@ export default function DocsPage() {
             <code className="font-mono">GET /healthz</code>
           </li>
           <li>
-            <code className="font-mono">listModels()</code> — available models
+            <code className="font-mono">listModels()</code> —{" "}
+            <code className="font-mono">GET /v1/models</code> (implemented in
+            Phase 4; requires an API key with{" "}
+            <code className="font-mono">models:read</code>)
           </li>
           <li>
             <code className="font-mono">register() / login() / me()</code> —
-            account lifecycle
+            account lifecycle (implemented in Phase 2)
           </li>
           <li>
             <code className="font-mono">listKeys() / createKey() / revokeKey()</code>{" "}
-            — scoped gateway keys
+            — scoped gateway keys (implemented in Phase 2)
+          </li>
+          <li>
+            <code className="font-mono">getCredits() / getCreditLedger()</code>{" "}
+            — owner-only balance and ledger (implemented in Phase 3)
           </li>
           <li>
             <code className="font-mono">getBillingSummary()</code> — spend
@@ -166,6 +178,17 @@ export default function DocsPage() {
             (later-phase placeholder)
           </li>
         </ul>
+        <p
+          role="note"
+          className="max-w-2xl rounded-lg border border-border bg-muted/40 p-4 text-sm text-muted-foreground"
+        >
+          Local development ships a placeholder model{" "}
+          <code className="font-mono">gateway-default</code> with zero pricing
+          and no configured upstream provider. Real inference calls to{" "}
+          <code className="font-mono">POST /v1/chat/completions</code> therefore
+          return <code className="font-mono">502</code> until a provider is
+          approved.
+        </p>
       </section>
     </div>
   );

@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-The stack is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Phase 1 established the topology, health/readiness, and data layer; Phase 2 added email/password auth and API-key management; Phase 3 added the credit ledger service and dashboard credit reads. Later-phase tasks are marked TODO.
+The stack is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Phase 1 established the topology, health/readiness, and data layer; Phase 2 added email/password auth and API-key management; Phase 3 added the credit ledger service and dashboard credit reads; Phase 4 added the OpenAI-compatible `/v1` inference surface with API-key scopes, request size caps, rate limiting, and the reserve/settle/refund lifecycle. Later-phase tasks are marked TODO.
 
 ## Start and stop
 
@@ -35,7 +35,7 @@ Expected Phase 1 behavior:
 
 - `/healthz` returns `{"status":"ok"}` while the API process is running.
 - `/readyz` returns 200 only when Postgres, Redis, and LiteLLM are reachable; otherwise 503 with per-dependency status.
-- LiteLLM starts with an empty model list in Phase 1; liveness exists, but inference routes are not configured.
+- LiteLLM started Phase 1 with an empty model list; liveness existed, but no inference routes were configured. (Phase 4 wires inference through LiteLLM while keeping `model_list` empty locally — see the Phase 4 section below.)
 - Worker job stubs return `{"status":"noop", "job": ...}`; no credits move yet.
 
 Expected Phase 2 behavior:
@@ -51,6 +51,14 @@ Expected Phase 3 behavior:
 - `GET /dashboard/credits` returns 200 with `balance_microcredits`, `reserved_microcredits`, and `available_microcredits` for the JWT's owner (`available = balance - reserved`).
 - `GET /dashboard/credits/ledger` returns 200 with a keyset-paginated envelope (`items`, `next_cursor`), newest first; pass `next_cursor` as `cursor` for the next page. Entries are append-only and never change.
 - The credit service (reserve/settle/refund/release_expired/grant_purchase) is idempotent per key, locks rows in the order users → credit_balances → credit_reservations, and enforces the per-user UTC-month spend cap on reserve. Reservations expire after 15 minutes by default.
+
+Expected Phase 4 behavior:
+
+- `GET /v1/models` (API key, scope `models:read`) returns the enabled `model_pricing` rows. Local dev seeds a single placeholder `gateway-default` at 0 microcredits/1k tokens, so the list has one entry.
+- `POST /v1/chat/completions` (API key, scope `chat:completions`) supports streaming and non-streaming. It runs size cap → validation → rate limit → reserve → forward to LiteLLM → settle/refund → `usage_events`.
+- **A real inference call in local dev returns `502 upstream_error`** because LiteLLM `model_list` is empty (no provider configured). This is expected: the reservation is **fully refunded**, so no credits are consumed. The 502 confirms the reserve/refund lifecycle works.
+- Rate limiting is per key: `RATE_LIMIT_REQUESTS_PER_MINUTE` (default 60) sliding window plus `RATE_LIMIT_MAX_CONCURRENT` (default 8) in-flight cap; breaches return `429` with `Retry-After`. It fails open if Redis is down.
+- A 1-microcredit floor is reserved even for zero-priced models; settlement charges the true cost and releases the hold.
 
 ## Common failures
 
@@ -78,14 +86,14 @@ Expected Phase 3 behavior:
 | Change to `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` has no effect on existing sessions | TTL is enforced by the `exp` claim baked into issued tokens | Existing tokens keep their original expiry. New logins pick up the new TTL. Range is 5–1440 minutes. |
 | `/dashboard/keys*` returns 404 | Key ID does not exist or belongs to a different user (existence is deliberately not revealed) | Use the owning account; do not weaken the 404 behavior. |
 | `POST /dashboard/keys` returns 422 | Blank/oversized name (>64 chars), unknown scope, or an empty scopes list | Use only `chat:completions` and/or `models:read`, with at least one scope. |
-| Revoked key still authenticates for up to ~60s | Stale Redis lookup cache (bounded) | Confirm the `DELETE /dashboard/keys/{id}` returned 204 and that `api_keys.revoked_at` is set. Cache entries are deleted on revoke; if the delete failed, the key remains usable for at most the 60s TTL. Inference enforcement itself (`/v1/*`) arrives in a later phase. |
-| Verifying revocation locally | `/v1` auth not yet wired | Check `audit_logs` for `api_key.revoke` rows, list keys via `GET /dashboard/keys` (revoked keys show `revoked_at`), or query Redis (`KEYS apikey:*`) to confirm the entry is gone. |
+| Revoked key still authenticates for up to ~60s | Stale Redis lookup cache (bounded) | Confirm the `DELETE /dashboard/keys/{id}` returned 204 and that `api_keys.revoked_at` is set. Cache entries are deleted on revoke; if the delete failed, the key remains usable for at most the 60s TTL. `/v1` routes authenticate with the same key (Phase 4), so the bounded window applies there too. |
+| Verifying revocation locally | Check the key's current authentication result | Call `GET /v1/models` with the revoked key and expect `401 invalid_api_key` (allow up to ~60s for cache expiry). Also check `audit_logs` for `api_key.revoke` rows, list keys via `GET /dashboard/keys` (revoked keys show `revoked_at`), or query Redis (`KEYS apikey:*`) to confirm the entry is gone. |
 | Password reset needed for a local account | Not yet implemented | Create a second account via `/auth/register`, or (destructive) reset the local DB via `make migrate` after deleting the user row. Do not store plaintext passwords while working around this. |
 
 ### 401 vs 403 quick reference
 
 - **401 Unauthorized** — the request has no valid credentials (missing/expired/malformed JWT, login failure, invalid/revoked API key). Re-authenticate.
-- **403 Forbidden** — credentials are valid but the account is suspended on an authenticated route (`user_suspended`). Do not retry with the same token.
+- **403 Forbidden** — credentials are valid but the account is suspended on an authenticated route (`user_suspended`), or the API key lacks the scope required by the `/v1` endpoint (`insufficient_scope`). Do not retry with the same token/key unless you have added the required scope.
 
 ## Phase 3 credit troubleshooting
 
@@ -116,6 +124,25 @@ SELECT
 
 - `ledger_balance` must equal `balance_row`, and `open_reserved` must equal `reserved_row`. Re-run outside busy traffic: in-flight transactions can show a transient difference.
 - A persistent mismatch is an incident: preserve logs/evidence and follow the incident-response steps below. The ledger is append-only (a trigger rejects UPDATE/DELETE) — never edit ledger rows or balances by hand. Reconciliation is read-only; an admin-only rebuild (replaying the ledger into `credit_balances`) is a later-phase tool.
+
+## Phase 4 `/v1` troubleshooting
+
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| `POST /v1/chat/completions` returns `401 invalid_api_key` in local dev | Missing/malformed/revoked API key, or the `sk_live_` key was not created after signup | Create a key via `POST /dashboard/keys` and send it as `Authorization: Bearer <key>`. Confirm `API_KEY_PEPPER` is unchanged; rotating it invalidates existing keys. |
+| `GET /v1/models` returns `403 insufficient_scope` | Key lacks `models:read` | Create a key with `models:read` in `scopes` (or both scopes). `403 user_suspended` instead means the owning account is suspended — do not retry. |
+| `POST /v1/chat/completions` returns `403 insufficient_scope` | Key lacks `chat:completions` (e.g. a models-only key) | Issue a key with `chat:completions`. Scope checks are per endpoint; a key for `/v1/models` is intentionally read-only. |
+| `404 model_not_found` | Model name is not an enabled `model_pricing` row | Check `GET /v1/models` for the exact alias. In local dev the only seeded alias is `gateway-default`. Real aliases require product sign-off and a `model_pricing` row. |
+| `402 insufficient_credits` | `available = balance - reserved` cannot cover the reservation (including the 1-microcredit floor) | Check `GET /dashboard/credits`. Look for open holds; they clear on settle/refund or at `RESERVATION_TTL_SECONDS` (default 900s). Do not hand-edit balances. |
+| `402 monthly_spend_cap_exceeded` | Per-user UTC-month cap would be exceeded | `users.spend_cap_monthly_microcredits = 0` disables the cap. The window resets at UTC month boundary. Adjust deliberately for local testing only. |
+| `413 request_too_large` | Body exceeds `MAX_REQUEST_BYTES` (default 1048576) | Shrink messages/payload or deliberately raise `MAX_REQUEST_BYTES` for local testing. The request is rejected before validation and before any reservation. |
+| `422 max_tokens_exceeded` | `max_tokens` exceeds `MAX_OUTPUT_TOKENS` (default 4096) | Lower `max_tokens`, or deliberately change `MAX_OUTPUT_TOKENS` for local testing. |
+| `429 rate_limit_exceeded` with `Retry-After` | Per-key sliding-window (default 60/min) or concurrent in-flight cap (default 8) hit | Wait the number of seconds in `Retry-After`, reduce concurrency (`RATE_LIMIT_MAX_CONCURRENT`), or space requests. If Redis is down, rate limiting fails open by design — check `/readyz` and `docker compose logs redis`. |
+| `502 upstream_error` | LiteLLM returned an error or has no routable model | **Expected in local dev:** `infra/litellm/config.yaml` keeps `model_list: []`, so no provider is configured. Confirm the reservation was fully refunded (`GET /dashboard/credits` shows available balance restored) and check `docker compose logs litellm api`. Do not add provider keys locally. |
+| `504 upstream_timeout` | LiteLLM/provider exceeded the read timeout (300s) | Check provider latency and `docker compose logs litellm api`. LiteLLM `request_timeout` is 300s, matching `HTTP_READ_TIMEOUT`; the reservation should be fully refunded. |
+| Streaming response stops early / `usage_events.status = partial` | Client disconnected mid-stream | Expected: only tokens actually produced are charged. Check the usage row and reservation status rather than assuming a full charge. |
+| Open reservation stuck after `502`/`504` or a crash | Reservation was not settled/refunded before the process died | Verify `credit_reservations.status` and `expires_at`. After `RESERVATION_TTL_SECONDS` (default 900s), run the credit service's `release_expired` locally; held credits are freed with a zero-amount `refund` row. Never edit ledger rows by hand. |
+| Zero-priced model shows a reservation | 1-microcredit floor applies even when the estimate is 0 | Expected: the hold exercises the reservation lifecycle and is released at settlement (true cost 0). Check for a `released`/`settled` reservation, not a stranded `open` one. |
 
 ## Data and persistence
 
@@ -175,7 +202,7 @@ Production on-call ownership, paging, and severity definitions are TODO.
 - Deployment rollback procedure and health-gated rollout
 - LiteLLM provider outage/fallback operations and model disablement
 - Stripe webhook replay/reconciliation procedure
-- Rate-limit/quota incident playbook
+- Production rate-limit/quota tuning and incident playbook (Phase 4 limits exist locally; production tiers need product sign-off)
 - Alert routing, SLOs, and dashboards
 - Password reset / email verification recovery procedures
 - Production session migration from `sessionStorage` to HttpOnly cookies via a BFF

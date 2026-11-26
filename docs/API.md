@@ -7,7 +7,8 @@ This document describes the FastAPI gateway's HTTP surface.
 - **Phase 1** implements health/readiness probes and the OpenAI-compatible error envelope.
 - **Phase 2** implements self-built email/password authentication (`/auth/*`) and API-key lifecycle management (`/dashboard/keys*`); `/auth/me` and `/dashboard/keys*` are protected by HS256 JWTs, while `/auth/register` and `/auth/login` are public.
 - **Phase 3** implements owner-only credit reads (`/dashboard/credits*`) and the internal credit ledger/reservation service (reserve, settle, refund, release_expired, grant_purchase); dashboard reads are protected by HS256 JWTs.
-- **Later phases** add inference (`/v1/*`), billing/webhooks (`/billing/*`, `/webhooks/*`), usage data, and admin tooling. These are documented as *planned* and are not implemented yet.
+- **Phase 4** implements the OpenAI-compatible `/v1/*` surface (GET `/v1/models`, POST `/v1/chat/completions` with streaming and non-streaming), API-key scope enforcement, request size caps, Redis-backed rate limiting, and the reserve/settle/refund lifecycle wired through LiteLLM.
+- **Later phases** add billing/webhooks (`/billing/*`, `/webhooks/*`), usage dashboards, and admin tooling. These are documented as *planned* and are not implemented yet.
 
 ## Base URLs
 
@@ -33,10 +34,11 @@ Every response includes an `X-Request-ID` header. If the request carried a sanit
 | `/auth/me` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 2 (implemented) |
 | `/dashboard/keys*` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 2 (implemented) |
 | `/dashboard/credits`, `/dashboard/credits/ledger` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 3 (implemented) |
-| `/v1/*` | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`) | later (planned) |
+| `/v1/models` | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`); scope `models:read` | 4 (implemented) |
+| `/v1/chat/completions` | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`); scope `chat:completions` | 4 (implemented) |
 | `/billing/*`, `/webhooks/*`, `/admin/*` | API key or JWT as appropriate; webhook signature verification | later (planned) |
 
-Phase 2 implements email/password authentication and JWT issuance. The cryptographic helpers (`apps/api/app/core/security.py`) are wired as FastAPI dependencies for `/dashboard/*` routes. Inference (`/v1/*`) auth dependencies arrive in a later phase.
+Phase 2 implements email/password authentication and JWT issuance. The cryptographic helpers (`apps/api/app/core/security.py`) are wired as FastAPI dependencies for `/dashboard/*` routes. Phase 4 wires the same API-key auth dependency into `/v1/*` and adds per-scope enforcement.
 
 ### Error envelope
 
@@ -58,14 +60,16 @@ All errors follow the OpenAI-compatible shape, regardless of the route:
 | 400 | `invalid_request_error` | (varies) |
 | 401 | `authentication_error` | `invalid_api_key` / `invalid_credentials` / `invalid_token` |
 | 402 | `invalid_request_error` | `insufficient_credits` / `monthly_spend_cap_exceeded` (credit-service reserve checks) |
-| 403 | `permission_error` | `forbidden` / `user_suspended` (`insufficient_scope` arrives with /v1 scope enforcement) |
-| 404 | `invalid_request_error` | `not_found` |
+| 403 | `permission_error` | `forbidden` / `user_suspended` / `insufficient_scope` (API key lacks the required scope for the endpoint) |
+| 404 | `invalid_request_error` | `not_found` / `model_not_found` (requested model is not enabled or not priced) |
 | 405 | `invalid_request_error` | `method_not_allowed` |
 | 409 | `invalid_request_error` | `email_exists` (email already registered) / `idempotency_conflict` (reused idempotency key with different parameters) |
 | 410 | `invalid_request_error` | `reservation_expired` (reservation passed `expires_at`) |
-| 422 | `invalid_request_error` | `invalid_request` (with `param` location) / `amount_too_large` / `invalid_ttl` (credit-service bounds) |
-| 429 | `rate_limit_error` | `rate_limit_exceeded` |
-| 502 | `api_error` | `upstream_error` |
+| 413 | `invalid_request_error` | `request_too_large` (request body exceeds `MAX_REQUEST_BYTES`) |
+| 422 | `invalid_request_error` | `invalid_request` (with `param` location) / `amount_too_large` / `invalid_ttl` (credit-service bounds) / `max_tokens_exceeded` (requested `max_tokens` exceeds `MAX_OUTPUT_TOKENS`) |
+| 429 | `rate_limit_error` | `rate_limit_exceeded` (per-key sliding-window or concurrent-cap breach; response includes `Retry-After` header in seconds) |
+| 502 | `api_error` | `upstream_error` (LiteLLM returned a non-timeout failure, or no routable model is configured) |
+| 504 | `api_error` | `upstream_timeout` (LiteLLM or the upstream provider did not respond within the read timeout) |
 | 5xx | `api_error` | `internal_error` |
 
 Unhandled exceptions are logged with the request ID and returned as a generic `500` body; prompts, completions, and credentials are redacted from logs.
@@ -311,7 +315,7 @@ Create a new API key. The raw key is returned **exactly once** in the response a
 
 **Scopes:** Currently supported scopes are `chat:completions` and `models:read`. The field is optional and defaults to both scopes; an explicit list must contain at least one known scope (max 2, duplicates deduplicated).
 
-**Redis lookup cache:** API-key lookups are cached in Redis for 60 seconds. Revocation deletes the entry immediately (see below). The cache backs the API-key auth dependency; the `/v1/*` inference routes that consume it arrive in a later phase.
+**Redis lookup cache:** API-key lookups are cached in Redis for 60 seconds. Revocation deletes the entry immediately (see below). The cache backs the API-key auth dependency consumed by the `/v1/*` inference routes (implemented in Phase 4).
 
 **Audit log:** Key creation is recorded in `audit_logs` with actor, action (`api_key.create`), and resource ID. The raw key and hash are never logged.
 
@@ -421,7 +425,7 @@ List the authenticated user's ledger entries, newest first. The ledger is **appe
 
 ### Credit service semantics (internal)
 
-The credit service provides `reserve`, `settle`, `refund`, `release_expired`, and `grant_purchase` operations. They are service-layer operations in Phase 3 (no public HTTP routes yet; `/v1` inference wiring arrives in a later phase) and share these guarantees:
+The credit service provides `reserve`, `settle`, `refund`, `release_expired`, and `grant_purchase` operations. They are service-layer operations introduced in Phase 3 and wired into the public `/v1/chat/completions` route in Phase 4. They share these guarantees:
 
 - **Idempotency:** ledger operations use the caller-supplied idempotency key plus a fingerprint (user, amount, reference); reservations use `(user_id, request_id)` uniqueness. Retries with the same key and parameters return the original outcome; reusing a key with different parameters is a `409 idempotency_conflict`. Reservation retries keep the original expiry (TTL is not fingerprinted).
 - **Row locking:** transactions lock rows with `SELECT ... FOR UPDATE` in a fixed order — `users` → `credit_balances` → `credit_reservations` — to avoid deadlocks.
@@ -430,16 +434,148 @@ The credit service provides `reserve`, `settle`, `refund`, `release_expired`, an
 - **Integer bounds:** every resulting `balance`, `reserved`, and lifetime total is validated against the signed `BIGINT` range *before* any mutation (`422 amount_too_large`); reservation TTL is capped at 86400 seconds (`422 invalid_ttl`).
 - **Expiry:** settling a reservation past `expires_at` returns `410 reservation_expired`; unknown or foreign reservations return `404 reservation_not_found` (existence is not revealed).
 
+## Implemented endpoints (Phase 4)
+
+Phase 4 adds the OpenAI-compatible inference surface. All `/v1/*` endpoints authenticate with an **API key** (`Authorization: Bearer sk_live_...`), not a dashboard JWT, and enforce a per-endpoint **scope** on that key. The public `/v1` surface is **not** browser-CORS-enabled.
+
+### Auth and scopes on `/v1`
+
+| Endpoint | Required scope |
+| --- | --- |
+| `GET /v1/models` | `models:read` |
+| `POST /v1/chat/completions` | `chat:completions` |
+
+- A missing, malformed, or revoked key returns `401 invalid_api_key`.
+- A valid key lacking the endpoint's scope returns `403 insufficient_scope`.
+- A key whose owner is suspended returns `403 user_suspended`.
+- A key with only `models:read` stays **read-only**: it cannot call chat completions.
+
+### `GET /v1/models`
+
+List the **enabled** model pricing rows as an OpenAI-compatible model list. This is the catalog the authenticated key is allowed to target.
+
+**Headers:** `Authorization: Bearer <api_key>` with scope `models:read`.
+
+**Response (200):**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gateway-default",
+      "object": "model",
+      "created": 1764140400,
+      "owned_by": "gateway"
+    }
+  ]
+}
+```
+
+Only rows that are enabled in `model_pricing` are returned. `GET /v1/models` is a metadata read: it does **not** reserve credits, touch the ledger, or call LiteLLM.
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Model list returned (may be empty if no models are enabled) |
+| 401 | Missing/invalid/revoked API key |
+| 403 | Key lacks `models:read` (`insufficient_scope`) or owner is suspended (`user_suspended`) |
+
+### `POST /v1/chat/completions`
+
+OpenAI-compatible chat completions, forwarded to LiteLLM. Supports **streaming** (`stream: true`) and **non-streaming** requests.
+
+**Headers:** `Authorization: Bearer <api_key>` with scope `chat:completions`; `Content-Type: application/json`.
+
+**Request:**
+
+```json
+{
+  "model": "gateway-default",
+  "messages": [
+    { "role": "user", "content": "Hello!" }
+  ],
+  "stream": false,
+  "max_tokens": 256
+}
+```
+
+`model` must reference an enabled model. `stream` and `max_tokens` are optional; `max_tokens` is bounded by `MAX_OUTPUT_TOKENS` (default 4096).
+
+**Response (200, non-streaming):** an OpenAI-compatible completion object.
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1764140400,
+  "model": "gateway-default",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "Hi there!" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 8,
+    "total_tokens": 20
+  }
+}
+```
+
+**Streaming (`stream: true`):** the response is `text/event-stream` (Server-Sent Events) proxied **unbuffered** from LiteLLM. Each event is a `data: {chat.completion.chunk}` line; the stream terminates with `data: [DONE]`. If the client disconnects mid-stream, only the tokens actually produced up to that point are charged, and the `usage_events` row is recorded with status `partial`.
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Completion returned (or stream opened) |
+| 400 | Malformed request body |
+| 401 | Missing/invalid/revoked API key |
+| 402 | `insufficient_credits` / `monthly_spend_cap_exceeded` on reserve |
+| 403 | Key lacks `chat:completions` (`insufficient_scope`) or owner is suspended (`user_suspended`) |
+| 404 | `model_not_found` — model is not enabled or not priced |
+| 413 | `request_too_large` — body exceeds `MAX_REQUEST_BYTES` |
+| 422 | `max_tokens_exceeded` — requested `max_tokens` exceeds `MAX_OUTPUT_TOKENS`, or shape validation fails |
+| 429 | `rate_limit_exceeded` — per-key rate or concurrency limit hit; see `Retry-After` |
+| 502 | `upstream_error` — LiteLLM returned an error, or no routable model is configured |
+| 504 | `upstream_timeout` — upstream did not respond within the read timeout |
+
+### Request flow and credit lifecycle
+
+`POST /v1/chat/completions` executes this order (a failure at any stage stops the request and returns the matching error; the reservation is never charged for work not forwarded):
+
+1. **Size cap** — reject bodies larger than `MAX_REQUEST_BYTES` with `413 request_too_large`.
+2. **Validation** — parse and validate the OpenAI request shape (`max_tokens ≤ MAX_OUTPUT_TOKENS`, known model, `stream` boolean, etc.).
+3. **Rate limit** — per-API-key sliding window (`RATE_LIMIT_REQUESTS_PER_MINUTE`) plus concurrent in-flight cap (`RATE_LIMIT_MAX_CONCURRENT`); breach returns `429 rate_limit_exceeded` with a `Retry-After` header.
+4. **Reserve** — open a credit reservation for the estimated cost. A **floor of 1 microcredit** is reserved even when the estimate is 0, so zero-priced models still exercise the hold. Insufficient available credits or a monthly-cap breach returns `402`.
+5. **Forward** — call LiteLLM over the private network with the master key, streaming if requested.
+6. **Settle or refund** — on success, settle the reservation to the true cost (charging the actual usage and releasing the unused hold). On upstream failure (`502`/`504`) or client abort before any billable tokens, the reservation is **fully refunded** so no credits are consumed for failed work.
+7. **Usage event** — record a `usage_events` row (idempotent on `request_id`) with tokens, cost, latency, and status (`success` / `partial` / `error`).
+
+Reservations are held for `RESERVATION_TTL_SECONDS` (default 900s) and are swept by the worker's `release_expired`, so a crashed request cannot strand credits indefinitely.
+
+### Rate limiting semantics
+
+- **Sliding-window request limit:** each API key gets `RATE_LIMIT_REQUESTS_PER_MINUTE` requests per rolling minute (default 60), tracked in Redis.
+- **Concurrent in-flight cap:** each key may have at most `RATE_LIMIT_MAX_CONCURRENT` requests in flight (default 8).
+- **`Retry-After`:** a `429 rate_limit_exceeded` response includes a `Retry-After` header (integer seconds) indicating when the client may retry.
+- **Fail-open on Redis outage:** if Redis is unavailable, rate limiting **fails open** — requests are allowed rather than blocked, so a cache outage does not take down inference. This is a deliberate availability-over-strictness tradeoff; credit reservation and spend caps (backed by PostgreSQL) still apply.
+
+### Local development behavior (expected)
+
+Local dev seeds **one placeholder pricing row** `gateway-default` at **0 microcredits** per 1k input/output tokens, and the LiteLLM `model_list` stays **empty** (no provider configured).
+
+- `GET /v1/models` returns the single `gateway-default` entry.
+- `POST /v1/chat/completions` passes auth, size, validation, rate-limit, and reservation (the 1-microcredit floor), then LiteLLM has no routable model and returns an error. The gateway maps this to **`502 upstream_error`** and **fully refunds** the reservation. Credits are not consumed.
+- This 502 is **expected** in local dev and confirms the reserve/refund lifecycle works end-to-end before a real provider is configured.
+
 ## Planned endpoints (later phases)
 
-These routes are not registered yet and currently return `404 not_found`; their routers exist as empty placeholders. They are listed here so clients can be shaped against a stable contract.
-
-### OpenAI-compatible inference
-
-| Method | Path | Phase | Notes |
-| --- | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | later | Streaming and non-streaming; API-key auth; forwards to LiteLLM with master key; records `usage_events` and settles credits |
-| `GET` | `/v1/models` | later | Lists models the authenticated key is allowed to call; admin sees all |
+These remaining routes are not registered yet and currently return `404 not_found`; their routers exist as empty placeholders. They are listed here so clients can be shaped against a stable contract. The `/v1/*` routes documented above are implemented in Phase 4 and are not listed here.
 
 ### Dashboard (additional endpoints)
 
@@ -448,7 +584,7 @@ These routes are not registered yet and currently return `404 not_found`; their 
 | `GET` | `/dashboard/usage` | later | Per-key, per-day, per-model aggregates |
 | `GET` | `/dashboard/billing` | later | Plan and upcoming invoice; the credit balance itself is already served by `GET /dashboard/credits` (Phase 3) |
 
-> **Note:** Authentication (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`) and API-key lifecycle (`GET/POST/DELETE /dashboard/keys*`) are implemented in Phase 2. The credit ledger and owner-only dashboard credit reads (`GET /dashboard/credits`, `GET /dashboard/credits/ledger`) are implemented in Phase 3. See the "Implemented endpoints" sections above.
+> **Note:** Authentication (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`) and API-key lifecycle (`GET/POST/DELETE /dashboard/keys*`) are implemented in Phase 2. The credit ledger and owner-only dashboard credit reads (`GET /dashboard/credits`, `GET /dashboard/credits/ledger`) are implemented in Phase 3. The OpenAI-compatible `/v1/models` and `/v1/chat/completions` routes are implemented in Phase 4. See the "Implemented endpoints" sections above.
 
 ### Billing and webhooks
 
@@ -468,7 +604,7 @@ These routes are not registered yet and currently return `404 not_found`; their 
 | Header | Direction | Description |
 | --- | --- | --- |
 | `X-Request-ID` | both | Request correlation ID (sanitized; max 128 chars). |
-| `Authorization` | request | `Bearer <jwt>` for `/auth/me` and `/dashboard/*`; `Bearer <api_key>` for `/v1` (later phase). |
+| `Authorization` | request | `Bearer <jwt>` for `/auth/me` and `/dashboard/*`; `Bearer <api_key>` for `/v1` (Phase 4). |
 | `Content-Type` | both | `application/json` for JSON bodies. |
 | `Accept` | request | `application/json` expected. |
 
@@ -480,10 +616,10 @@ Because the browser currently sends the JWT as a Bearer header (see the interim 
 
 ## Compatibility notes
 
-- The `/v1` surface is intended to be OpenAI-compatible for request/response shapes and error codes. Streaming (`stream: true`) and advanced features (function calling, responses API) are later phases.
+- The `/v1` surface is intended to be OpenAI-compatible for request/response shapes and error codes. Streaming (`stream: true`) is supported as of Phase 4; advanced features (function calling, responses API) are later phases.
 - Money is represented as integer **microcredits** (`1,000,000 microcredits = 1 credit`). No floating-point currency values are stored or returned.
-- Rate limiting and inference-side quota enforcement are not enforced yet; the Phase 3 credit service enforces available-credit and monthly-cap checks on reserve, and exposes owner-only dashboard credit reads (`GET /dashboard/credits`, `GET /dashboard/credits/ledger`).
-- Auth and API-key management are implemented in Phase 2; the credit ledger and dashboard credit reads are implemented in Phase 3. Inference (`/v1/*`), Stripe billing, webhooks, usage data, and admin tooling remain later phases.
+- As of Phase 4, `POST /v1/chat/completions` enforces the request size cap, validation, per-key rate limiting, and the credit reserve/settle/refund lifecycle; `GET /v1/models` lists enabled models. The Phase 3 credit service remains authoritative for balance, reservations, and the monthly cap.
+- Auth and API-key management are implemented in Phase 2; the credit ledger and dashboard credit reads are implemented in Phase 3; the OpenAI-compatible `/v1` inference surface is implemented in Phase 4. Stripe billing, webhooks, usage dashboards, and admin tooling remain later phases.
 
 ## Versioning and deprecation
 

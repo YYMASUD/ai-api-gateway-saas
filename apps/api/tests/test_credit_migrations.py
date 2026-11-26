@@ -144,9 +144,13 @@ def test_phase4_revision_id_fits_alembic_version_column() -> None:
     scripts = ScriptDirectory.from_config(_config())
     head = scripts.get_revision("head")
     assert head is not None
-    assert head.revision == "0004_request_id_per_user"
+    # The head moves with each phase; assert the property that matters
+    # (Alembic stores revisions in VARCHAR(32)) rather than a fixed id.
     assert len(head.revision) <= 32
-    assert head.down_revision == "0003_credit_reservations"
+    # 0004 must remain in the chain as an ancestor of the head.
+    revisions = {rev.revision for rev in scripts.walk_revisions()}
+    assert "0004_request_id_per_user" in revisions
+    assert len("0004_request_id_per_user") <= 32
 
 
 def test_phase4_upgrade_scopes_request_id_unique_per_user(capsys) -> None:

@@ -48,9 +48,18 @@ test("docs page documents the OpenAI-compatible example", async ({ page }) => {
   ).toBeVisible();
   await expect(page.getByText("NEXT_PUBLIC_API_BASE_URL").first()).toBeVisible();
   await expect(page.getByText("GET /healthz").first()).toBeVisible();
+  // Phase 4 endpoints are now documented as implemented, not placeholders.
+  await expect(page.getByText("GET /v1/models").first()).toBeVisible();
+  await expect(
+    page.getByText("POST /v1/chat/completions").first(),
+  ).toBeVisible();
+  // Only billing and usage remain later-phase placeholders.
   await expect(
     page.getByText(/later-phase placeholder/i).first(),
   ).toBeVisible();
+  // The local placeholder model and its 502 behaviour are called out.
+  await expect(page.getByText("gateway-default").first()).toBeVisible();
+  await expect(page.getByText(/return 502/i).first()).toBeVisible();
 });
 
 test("admin placeholder is reachable", async ({ page }) => {

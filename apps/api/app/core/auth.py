@@ -109,11 +109,27 @@ async def get_api_key_principal(
     return await service.authenticate(credentials.credentials)
 
 
+def require_scope(principal: APIKeyPrincipal, scope: str) -> None:
+    """Raise ``PermissionDeniedError`` (403) if the principal lacks ``scope``.
+
+    API keys carry an explicit scope list; the gateway's ``/v1`` routes
+    consult this helper to refuse calls the key was not authorised for.
+    The error code ``insufficient_scope`` matches OpenAI's documented
+    permission-error vocabulary.
+    """
+    if scope not in principal.scopes:
+        raise PermissionDeniedError(
+            f"API key is missing required scope: {scope}",
+            code="insufficient_scope",
+        )
+
+
 __all__ = [
     "get_api_key_principal",
     "get_api_key_repository",
     "get_current_user",
     "request_settings",
     "require_admin",
+    "require_scope",
     "verify_access_token_claims",
 ]

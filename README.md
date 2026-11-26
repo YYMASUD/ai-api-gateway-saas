@@ -2,7 +2,7 @@
 
 Production-grade AI API gateway SaaS with credit billing, API keys, usage metering, and OpenAI-compatible routing.
 
-This repository is in **Phase 2**: the Phase 1 infrastructure, CI, and documentation foundation plus application skeletons are in place, and Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Inference, billing, and production deployment are still **not implemented**, and the stack does not deploy anywhere yet.
+This repository is in **Phase 4**: the Phase 1 infrastructure/CI foundation, Phase 2 authentication and API keys, Phase 3 credit ledger, and Phase 4 OpenAI-compatible `/v1` inference are implemented. Phase 4 adds `GET /v1/models`, `POST /v1/chat/completions` (streaming and non-streaming), API-key scope enforcement, request size caps, Redis-backed rate limiting, and the reserve/settle/refund lifecycle. **Local defaults are local-only:** LiteLLM is stateless with an empty `model_list` and one zero-priced `gateway-default` placeholder pricing row, so real inference calls return `502 upstream_error` with a full reservation refund until a provider is approved. Billing webhooks and production deployment are still **not implemented**, and the stack does not deploy anywhere yet.
 
 ## What is here
 
@@ -11,7 +11,7 @@ This repository is in **Phase 2**: the Phase 1 infrastructure, CI, and documenta
 | `apps/web` | Next.js 15 dashboard/public site (owned by the web workstream) |
 | `apps/api` | FastAPI public gateway and private orchestration API |
 | `apps/worker` | Private ARQ background worker |
-| `infra/litellm` | LiteLLM proxy configuration skeleton |
+| `infra/litellm` | Stateless LiteLLM proxy configuration (empty `model_list` in local dev) |
 | `infra/terraform` | Deployment-phase Terraform placeholders |
 | `infra/monitoring` | Observability placeholders |
 | `docs` | Architecture, security, runbook, and API contracts |
@@ -44,7 +44,7 @@ Hard boundaries:
 - Only `web` (3000) and `api` (8000) publish host ports; both bind to `127.0.0.1` in the local stack.
 - `postgres`, `redis`, `litellm`, and `worker` have **no published ports**. There is exactly one network, `backend`.
 - Next.js holds **no** provider keys and no Postgres/Redis/LiteLLM credentials. It talks to FastAPI only.
-- Only FastAPI calls LiteLLM, using `LITELLM_MASTER_KEY` from the environment.
+- Only FastAPI calls LiteLLM, using `LITELLM_MASTER_KEY` from the environment. LiteLLM runs **stateless** (no database, no virtual keys); FastAPI/PostgreSQL owns authentication, billing, spend caps, and usage metering.
 - Upstream provider credentials are injected into the LiteLLM container from a secrets manager and referenced as `os.environ/<NAME>` in `infra/litellm/config.yaml`. They are never committed and never given to web/API/worker.
 - All secrets come from environment variables or a secrets manager. `.env.example` is blank by design.
 
@@ -164,7 +164,7 @@ The web build reads `NEXT_PUBLIC_API_BASE_URL` at build time; it must be a publi
 
 `apps/web/.npmrc` pins installs to `https://registry.npmjs.org/`, and CI rejects any `http://` or non-canonical `"resolved"` URL in `package-lock.json` before running `npm ci`.
 
-## Phase 1 and Phase 2 status
+## Phase 1–4 status
 
 Implemented in Phase 1:
 
@@ -184,16 +184,30 @@ Implemented in Phase 2:
 - Dashboard endpoints `GET /dashboard/keys`, `POST /dashboard/keys`, `DELETE /dashboard/keys/{id}`
 - Next.js login/signup pages and a keys UI that store the Bearer JWT in `sessionStorage` as an **interim Phase 2 measure** (see `docs/SECURITY.md`)
 
+Implemented in Phase 3:
+
+- Credit ledger service: append-only `credit_ledger` plus materialised `credit_balances` and `credit_reservations`; `reserve`/`settle`/`refund`/`release_expired`/`grant_purchase` with row locking, idempotency, and integer microcredits
+- Owner-only dashboard credit reads: `GET /dashboard/credits`, `GET /dashboard/credits/ledger` (JWT `sub`)
+- Per-user UTC-month spend cap (`users.spend_cap_monthly_microcredits`) enforced on reserve
+
+Implemented in Phase 4:
+
+- OpenAI-compatible `GET /v1/models` (scope `models:read`; lists enabled `model_pricing` rows, no credit reservation) and `POST /v1/chat/completions` (scope `chat:completions`; streaming and non-streaming) — API-key auth
+- Fixed pipeline: size cap → validation → rate limit → reserve → forward to LiteLLM → settle/refund → `usage_events`
+- Request size cap (`MAX_REQUEST_BYTES`), output-token cap (`MAX_OUTPUT_TOKENS`), and Redis-backed per-key rate limiting (`RATE_LIMIT_REQUESTS_PER_MINUTE` sliding window + `RATE_LIMIT_MAX_CONCURRENT` in-flight cap; fails open on Redis outage; `429` with `Retry-After`)
+- Reservation floor of 1 microcredit even for zero-priced models; full refund on `502 upstream_error` / `504 upstream_timeout`; partial charging on client disconnect
+- Stateless LiteLLM: no database, no virtual keys; FastAPI/PostgreSQL authoritative for auth/billing/spend caps
+- **Local-only defaults:** empty LiteLLM `model_list` and one zero-priced `gateway-default` placeholder; real inference returns `502 upstream_error` (fully refunded) until a provider is approved
+
 Not yet implemented (later phases):
 
-- Real OpenAI-compatible `/v1/chat/completions` and `/v1/models` behavior
-- Rate limiting and quota enforcement for API keys
-- Credit reservation/settlement, Stripe checkout/webhooks, usage ingestion, and email delivery
-- LiteLLM virtual keys / database-backed spend tracking
+- Stripe checkout/webhooks, billing dashboard, and usage dashboards/rollups
+- Real upstream providers/models and public aliases (pending product sign-off); local dev uses only the zero-priced `gateway-default` placeholder and an empty LiteLLM `model_list`, so real inference returns `502 upstream_error` with a full reservation refund
 - Production deployment, TLS/ingress, managed databases, secret-manager wiring, and monitoring stacks
 - Durable audit export, on-call alert routing, and SLOs
 - Migration from interim `sessionStorage` JWTs to HttpOnly cookie / BFF-based session handling
 - Password reset and account recovery flows
+- Worker job bodies and scheduling for usage rollups, expiry sweeps, webhooks, and email
 
 See [docs/API.md](docs/API.md) for the implemented vs. planned API surface and [docs/SECURITY.md](docs/SECURITY.md) for the auth/key threat model.
 
@@ -211,8 +225,8 @@ Assumptions:
 
 Open questions:
 
-- Which upstream model providers and public model aliases are approved for the first paid launch?
-- Should LiteLLM be stateless (billing authoritative in FastAPI) or use its own database for virtual keys and spend logs?
+- Which upstream model providers and public model aliases are approved for the first paid launch? (LiteLLM stays stateless either way; provider/model selection is pending product sign-off.)
+- Decided: LiteLLM is stateless — no LiteLLM database/virtual keys; FastAPI is authoritative for billing.
 - Pricing/credit-pack catalog and Stripe product/price model are not fixed.
 - Email provider choice and deliverability/domain setup are not fixed.
 - Observability backend, retention, alert routing, and on-call ownership are not fixed.

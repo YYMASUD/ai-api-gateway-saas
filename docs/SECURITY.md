@@ -7,8 +7,9 @@ This document describes the current security posture and the controls required b
 - **Phase 1** focuses on secret isolation, network boundaries, request tracing, redacted logging, and CI checks.
 - **Phase 2** adds self-built email/password authentication (Argon2id) and API-key lifecycle management in FastAPI.
 - **Phase 3** adds the credit ledger service (row-locked, idempotent reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads.
+- **Phase 4** wires the OpenAI-compatible `/v1` inference surface through stateless LiteLLM, adding API-key scope enforcement, request size caps, Redis-backed rate limiting (deliberately fail-open on Redis outage), and the reserve/settle/refund lifecycle end-to-end.
 
-Rate limiting, inference-side billing enforcement (`/v1` wiring), and production monitoring remain planned/later-phase work; the Phase 3 credit service already enforces balance and monthly-cap checks on reserve. The dashboard's interim client-side token handling (see [Interim dashboard token handling](#interim-dashboard-token-handling-sessionstorage)) is **not** production-acceptable and must be migrated.
+Stripe billing/webhooks, usage dashboards, and production monitoring remain later-phase work. The dashboard's interim client-side token handling (see [Interim dashboard token handling](#interim-dashboard-token-handling-sessionstorage)) is **not** production-acceptable and must be migrated.
 
 ## Assets and threat model
 
@@ -77,8 +78,19 @@ openssl rand -hex 24   # POSTGRES_PASSWORD / REDIS_PASSWORD
 - Format: `sk_live_` + base62 encoding of **32 random bytes** from a CSPRNG.
 - Storage: only `SHA-256(raw_key + API_KEY_PEPPER)` (hex) and the **8-character prefix** are persisted; raw keys are shown **once** at creation and never retrievable.
 - Verification recomputes `SHA-256(raw_key + API_KEY_PEPPER)` and looks it up by indexed equality against `api_keys.key_hash`; a constant-time comparison helper (`verify_api_key`) exists for direct hash comparison.
-- Scopes: explicit allowlist (`chat:completions`, `models:read`); unknown scopes are rejected with `422`.
-- Lookup cache: successful key lookups are cached in Redis for **60 seconds**. Revocation deletes the cache entry immediately; if that delete fails, the key stops working within the 60s TTL (stale-but-bounded). A cached principal for a subsequently suspended user can also continue to authenticate for at most this 60s window; suspension is not yet an immediate cache purge trigger. `last_used_at` is written on the DB-lookup (cache-miss) path, so its granularity is approximately the 60s cache TTL. API keys are only meaningful once `/v1` auth is wired (later phase).
+- Scopes: explicit allowlist (`chat:completions`, `models:read`); unknown scopes are rejected with `422`. As of Phase 4 the `/v1` routes **enforce** these scopes per endpoint: `GET /v1/models` requires `models:read`, `POST /v1/chat/completions` requires `chat:completions`; a valid key missing the required scope gets `403 insufficient_scope`.
+- Lookup cache: successful key lookups are cached in Redis for **60 seconds**. Revocation deletes the cache entry immediately; if that delete fails, the key stops working within the 60s TTL (stale-but-bounded). A cached principal for a subsequently suspended user can also continue to authenticate for at most this 60s window; suspension is not yet an immediate cache purge trigger. `last_used_at` is written on the DB-lookup (cache-miss) path, so its granularity is approximately the 60s cache TTL. API keys authenticate all `/v1` requests (Phase 4).
+
+### API-key controls on `/v1` (Phase 4)
+
+- **Scope enforcement.** Every `/v1` request authenticates with a hashed API key and requires the scope for that endpoint (`models:read` for `GET /v1/models`, `chat:completions` for `POST /v1/chat/completions`). Missing/invalid/revoked keys return `401 invalid_api_key`; a valid key without the required scope returns `403 insufficient_scope`. No privilege is inferred from key name or owner.
+- **Request size cap.** Bodies larger than `MAX_REQUEST_BYTES` (default 1,048,576 bytes) are rejected with `413 request_too_large` **before** parsing, validation, or any credit reservation, bounding memory/CPU abuse. `max_tokens` is bounded by `MAX_OUTPUT_TOKENS` (default 4096) and returns `422 max_tokens_exceeded`.
+- **Rate limiting.** Per-key Redis sliding window (`RATE_LIMIT_REQUESTS_PER_MINUTE`, default 60/min) plus a concurrent in-flight cap (`RATE_LIMIT_MAX_CONCURRENT`, default 8) bound cost and abuse. Breaches return `429 rate_limit_exceeded` with a `Retry-After` header.
+- **Deliberate fail-open tradeoff.** If Redis is unavailable, rate limiting **fails open** (requests proceed) to keep inference available during a cache outage. This is an accepted availability-over-strictness decision: an attacker with a valid key could exceed nominal limits during the outage. PostgreSQL-backed credit checks, reservations, spend caps, and the size cap still apply, so financial exposure stays bounded. Do not claim full abuse protection during Redis degradation.
+- **No prompt/completion content stored or logged.** Prompts, messages, and completions are never persisted in the application database or written to logs/usage events. `usage_events` stores only user/key/model IDs, token counts, cost, latency, and status. Structured logging redacts sensitive fields and known token formats, including message bodies. Only the streaming transport relays content between LiteLLM and the client.
+- **Master key confinement.** `LITELLM_MASTER_KEY` is shared only with the `api` service and the LiteLLM container over the private network. It is never returned to clients, the browser, or `web`/`worker`, and is never inline in config or images.
+- **Full refund on upstream failure.** A reservation is opened before forwarding (with a 1-microcredit floor even for zero estimates). If LiteLLM fails (`502 upstream_error`) or times out (`504 upstream_timeout`), the reservation is **fully refunded** via a zero-amount `refund` ledger row; credits are not consumed for work that did not complete. For streaming client disconnects, only tokens actually produced are charged (`usage_events.status = partial`).
+- **Stateless LiteLLM.** No LiteLLM database, virtual keys, or LiteLLM-side spend state. FastAPI/PostgreSQL is the single authority for auth, billing, and spend caps, so there is no second credential or quota store to drift out of sync.
 
 ### Audit logging
 
@@ -122,10 +134,10 @@ Required production migration:
 - `postgres`, `redis`, `litellm`, and `worker` publish no host ports. They are reachable only from services on the `backend` Docker network.
 - LiteLLM needs outbound internet access to providers; the local `backend` network is therefore not marked `internal`. In production, restrict egress with a firewall/proxy allowlist.
 - The API Dockerfile runs as an unprivileged user and defines its own `/healthz` container healthcheck; the worker Dockerfile also runs unprivileged.
-- Redis requires a password even on the private network. AOF persistence is enabled.
+- Redis requires a password even on the private network. AOF persistence is enabled. Phase 4 rate-limit state lives in Redis; its unavailability makes rate limiting fail open rather than blocking inference.
 - Postgres is initialized with data checksums.
 
-## Application controls implemented (Phases 1–3)
+## Application controls implemented (Phases 1–4)
 
 - Pydantic settings read environment variables only; secret fields reject blank values.
 - Passwords are hashed with Argon2id; login returns generic invalid-credential `401` responses.
@@ -136,13 +148,16 @@ Required production migration:
 - Credit/usage money values are signed `BIGINT` microcredits with non-negative balance checks, avoiding floating point accounting errors.
 - Request IDs are sanitized (length/control-character checks), attached to responses, and bound into log context.
 - CORS is applied to all routes except the public `/v1` surface, using an origin derived from `APP_URL`.
+- `/v1` enforces per-endpoint API-key scopes (`insufficient_scope`), a request body size cap (`request_too_large`), and Redis-backed per-key rate limits with `Retry-After`; rate limiting fails open on Redis outage by design while PostgreSQL credit controls remain authoritative.
+- `/v1` never stores or logs prompt/completion content; `usage_events` records only token counts, cost, latency, and status.
+- The reserve is fully refunded on `502 upstream_error` / `504 upstream_timeout`, so failed inference consumes no credits.
 - Security headers are set for all web routes: CSP, HSTS (non-production `max-age=0`), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, Permissions-Policy.
 - LiteLLM config enables retries/timeouts and contains no keys; master key is read from `os.environ`.
 - CI uses least-privilege `contents: read`, pinned action SHAs, `persist-credentials: false`, gitleaks, pip-audit, npm audit, and compose validation.
 
 ## Required before production traffic
 
-1. Wire API-key auth into `/v1`; enforce per-key spend/rate limits and quota.
+1. Validate and product-sign-off on upstream providers/models; keep `/v1` rate limits, size caps, and scope enforcement tuned for launch traffic (they are implemented in Phase 4 but need production tuning).
 2. Migrate the dashboard from interim `sessionStorage` JWTs to HttpOnly cookies behind a BFF, and add CSRF protections.
 3. Add password reset/recovery and email verification; add login rate limiting/lockout and breached-password checks.
 4. Verify Stripe webhook signatures and make all event handling idempotent.

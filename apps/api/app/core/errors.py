@@ -74,6 +74,18 @@ class RateLimitError(APIError):
     error_type = "rate_limit_error"
     code = "rate_limit_exceeded"
 
+    def __init__(
+        self,
+        message: str = "Rate limit exceeded",
+        *,
+        retry_after: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        # Whole seconds the client should wait before retrying; the route
+        # copies this onto the ``Retry-After`` header.
+        self.retry_after = retry_after
+
 
 class UpstreamError(APIError):
     status_code = 502

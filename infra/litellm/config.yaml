@@ -1,4 +1,4 @@
-# LiteLLM proxy configuration (Phase 1 skeleton).
+# LiteLLM proxy configuration (Phase 4).
 #
 # Security rules:
 #   * No provider credentials are stored here. Upstream keys are injected into
@@ -6,8 +6,22 @@
 #     referenced with `os.environ/<NAME>` (see the example below).
 #   * The proxy is private-network only. Only FastAPI calls it, using
 #     LITELLM_MASTER_KEY; the browser never receives that key.
-#   * Provider/model choices are intentionally not made in Phase 1. Populate the
-#     model list when a provider contract is approved.
+#   * Provider/model choices are intentionally not made yet. `model_list` stays
+#     empty until a provider contract and public model aliases are approved.
+#
+# STATELESS MODE (Phase 4):
+#   * LiteLLM runs WITHOUT its own database: no `database_url`, no
+#     `store_model_in_db`, and no virtual keys. FastAPI is authoritative for
+#     authentication, billing, spend caps, and usage metering, and it forwards
+#     requests using the shared master key.
+#   * Do not enable LiteLLM's database, UI, or virtual-key features here. Billing
+#     and reservations live in the gateway's PostgreSQL, not in LiteLLM.
+#
+# LOCAL DEV BEHAVIOR:
+#   * `model_list` is empty, so there is no routable upstream model. A real
+#     `/v1/chat/completions` call in local dev therefore returns `502
+#     upstream_error` from FastAPI, and the gateway fully refunds the credit
+#     reservation. This is expected until a provider is configured.
 
 model_list: []
 # Example shape only -- replace with approved providers and secret-managed names:
@@ -25,8 +39,10 @@ model_list: []
 #       # tpm: <int>
 
 litellm_settings:
-  # Conservative defaults; tune per provider in a later phase.
-  request_timeout: 60
+  # Match the gateway's HTTP read timeout (HTTP_READ_TIMEOUT, 300s) so a slow
+  # upstream does not trip LiteLLM's timeout before FastAPI's. Tune per provider
+  # in a later phase.
+  request_timeout: 300
   num_retries: 2
   drop_params: true
   # Fallback pairs go here once at least two model groups exist, for example:
@@ -38,10 +54,11 @@ litellm_settings:
 router_settings:
   routing_strategy: simple-shuffle
   num_retries: 2
-  timeout: 60
+  # Aligned with litellm_settings.request_timeout and the gateway read timeout.
+  timeout: 300
   allowed_fails: 3
   cooldown_time: 30
-  # Redis-backed routing state is optional in Phase 1. Enable only when more
+  # Redis-backed routing state is optional in Phase 4. Enable only when more
   # than one LiteLLM replica runs:
   # redis_host: os.environ/REDIS_HOST
   # redis_port: os.environ/REDIS_PORT
@@ -50,7 +67,7 @@ router_settings:
 general_settings:
   # Master key is read from the container environment only, never inline.
   master_key: os.environ/LITELLM_MASTER_KEY
-  # The gateway's own PostgreSQL is authoritative for billing and metering.
-  # LiteLLM's optional database/UI features stay disabled in Phase 1.
+  # STATELESS: no LiteLLM database, no virtual keys, no spend tracking here.
+  # FastAPI/PostgreSQL are authoritative for billing and metering.
   # store_model_in_db: false
   # database_url: os.environ/LITELLM_DATABASE_URL

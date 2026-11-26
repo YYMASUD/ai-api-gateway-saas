@@ -78,6 +78,11 @@ services:
       SPEND_ALERT_THRESHOLD_MICROCREDITS: ${SPEND_ALERT_THRESHOLD_MICROCREDITS:-0}
       HTTP_CONNECT_TIMEOUT: ${HTTP_CONNECT_TIMEOUT:-5}
       HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-300}
+      MAX_OUTPUT_TOKENS: ${MAX_OUTPUT_TOKENS:-4096}
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      RATE_LIMIT_REQUESTS_PER_MINUTE: ${RATE_LIMIT_REQUESTS_PER_MINUTE:-60}
+      RATE_LIMIT_MAX_CONCURRENT: ${RATE_LIMIT_MAX_CONCURRENT:-8}
+      RESERVATION_TTL_SECONDS: ${RESERVATION_TTL_SECONDS:-900}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
@@ -190,6 +195,9 @@ services:
   litellm:
     # Pinned release; the digest was resolved from GHCR at authoring time.
     # TODO(later phase): automate digest refreshes and verify signatures.
+    # Request timeout lives in infra/litellm/config.yaml (request_timeout: 300),
+    # aligned with the api service's HTTP_READ_TIMEOUT (300s). Stateless: no
+    # LiteLLM database or virtual keys; FastAPI owns billing.
     image: ghcr.io/berriai/litellm:v1.111.0@sha256:ce00096d012719d58c52cecfa373f7c6256dd1b0ff08f6fa607e10e9628f1f46
     command:
       - --config

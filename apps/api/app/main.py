@@ -40,6 +40,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await database_state.init(settings)
     redis_client: Redis = create_redis_client(settings)
     app.state.redis = redis_client
+    # Shared client for /v1 chat upstream calls (configured connect/read
+    # timeouts). Created before the readiness client so each has its own
+    # timeout policy; both are closed exactly once on shutdown.
+    chat_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.http_read_timeout, connect=settings.http_connect_timeout)
+    )
+    app.state.chat_client = chat_client
     # One shared client for readiness probes; closed exactly once on shutdown.
     litellm_client = httpx.AsyncClient(
         timeout=httpx.Timeout(_READINESS_TIMEOUT_SECONDS, connect=2.0)
@@ -50,7 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         # Close each resource independently so one failure cannot skip the rest.
-        for resource in (litellm_client, redis_client):
+        for resource in (chat_client, litellm_client, redis_client):
             try:
                 await resource.aclose()
             except Exception:

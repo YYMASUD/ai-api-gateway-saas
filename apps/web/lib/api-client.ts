@@ -118,6 +118,41 @@ export interface UsageSummary {
   records: UsageRecord[];
 }
 
+/**
+ * Owner-only wallet state in integer microcredits (`GET /dashboard/credits`).
+ * `available_microcredits` equals `balance - reserved`.
+ */
+export interface CreditBalance {
+  balance_microcredits: number;
+  reserved_microcredits: number;
+  available_microcredits: number;
+  lifetime_purchased_microcredits: number;
+  lifetime_spent_microcredits: number;
+}
+
+/** A single append-only credit ledger entry. */
+export interface CreditLedgerEntry {
+  id: string;
+  type: string;
+  amount_microcredits: number;
+  reference_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+/** A page of the owner's ledger, newest first. */
+export interface CreditLedgerPage {
+  items: CreditLedgerEntry[];
+  next_cursor: string | null;
+}
+
+export interface CreditLedgerQuery {
+  /** Page size; the server accepts `1..100` (default 50). */
+  limit?: number;
+  /** Opaque cursor from a previous `next_cursor`. */
+  cursor?: string | null;
+}
+
 interface OpenAIErrorEnvelope {
   error?: unknown;
   detail?: unknown;
@@ -234,6 +269,10 @@ export interface ApiClient {
   createKey(body: CreateKeyRequest): Promise<CreatedApiKey>;
   /** Revoke a key (`DELETE /dashboard/keys/{id}`). */
   revokeKey(id: string): Promise<void>;
+  /** Owner-only wallet state (`GET /dashboard/credits`), implemented in Phase 3. */
+  getCredits(): Promise<CreditBalance>;
+  /** Owner-only ledger page (`GET /dashboard/credits/ledger`), newest first. */
+  getCreditLedger(query?: CreditLedgerQuery): Promise<CreditLedgerPage>;
   /** Later-phase placeholder: `GET /dashboard/billing` is not implemented yet. */
   getBillingSummary(): Promise<BillingSummary>;
   /** Later-phase placeholder: `GET /dashboard/usage` is not implemented yet. */
@@ -364,6 +403,16 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       request<void>(`/dashboard/keys/${encodeURIComponent(id)}`, {
         method: "DELETE",
       }),
+    getCredits: () => request<CreditBalance>("/dashboard/credits"),
+    getCreditLedger: ({ limit, cursor } = {}) => {
+      const params = new URLSearchParams();
+      if (limit !== undefined) params.set("limit", String(limit));
+      if (cursor) params.set("cursor", cursor);
+      const query = params.toString();
+      return request<CreditLedgerPage>(
+        `/dashboard/credits/ledger${query ? `?${query}` : ""}`,
+      );
+    },
     // Later-phase placeholders below: paths follow the documented future
     // dashboard contract so this typed surface stays stable when they land.
     getBillingSummary: () => request<BillingSummary>("/dashboard/billing"),

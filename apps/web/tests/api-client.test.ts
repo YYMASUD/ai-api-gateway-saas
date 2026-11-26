@@ -131,6 +131,8 @@ describe("createApiClient", () => {
 
     await client.listModels();
     await client.listKeys();
+    await client.getCredits();
+    await client.getCreditLedger();
     await client.getBillingSummary();
     await client.getUsage();
 
@@ -138,9 +140,56 @@ describe("createApiClient", () => {
     expect(urls).toEqual([
       "http://localhost:8000/v1/models",
       "http://localhost:8000/dashboard/keys",
+      "http://localhost:8000/dashboard/credits",
+      "http://localhost:8000/dashboard/credits/ledger",
       "http://localhost:8000/dashboard/billing",
       "http://localhost:8000/dashboard/usage",
     ]);
+  });
+
+  it("fetches owner-only credits with the bearer token", async () => {
+    const balance = {
+      balance_microcredits: 10_000_000,
+      reserved_microcredits: 500_000,
+      available_microcredits: 9_500_000,
+      lifetime_purchased_microcredits: 20_000_000,
+      lifetime_spent_microcredits: 10_000_000,
+    };
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) => jsonResponse(balance),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    await expect(client.getCredits()).resolves.toEqual(balance);
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://localhost:8000/dashboard/credits");
+    expect(init?.method).toBe("GET");
+    expect(init?.headers).toMatchObject({
+      Authorization: `Bearer ${FAKE_TOKEN}`,
+    });
+  });
+
+  it("encodes ledger limit and cursor query parameters", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse({ items: [], next_cursor: null }),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(
+      client.getCreditLedger({ limit: 2, cursor: "entry/with space" }),
+    ).resolves.toEqual({ items: [], next_cursor: null });
+    expect(fetchImpl.mock.calls[0][0]).toBe(
+      "http://localhost:8000/dashboard/credits/ledger?limit=2&cursor=entry%2Fwith+space",
+    );
+    expect(fetchImpl.mock.calls[0][1]?.method).toBe("GET");
   });
 
   it("POSTs registration payloads to /auth/register", async () => {

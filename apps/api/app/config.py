@@ -51,6 +51,18 @@ class Settings(BaseSettings):
     # Reserved for Phase 2 billing alerts; signed microcredits (BIGINT).
     spend_alert_threshold_microcredits: int = Field(default=0, ge=0)
 
+    # Phase 4 /v1 gateway limits. All env-only; no secret defaults.
+    # Upper bound on the caller-requested ``max_tokens`` (output budget).
+    max_output_tokens: int = Field(default=4096, ge=1, le=128000)
+    # Largest accepted request body in bytes (1 MiB by default).
+    max_request_bytes: int = Field(default=1048576, ge=1024)
+    # Per-API-key sliding-window request budget per minute.
+    rate_limit_requests_per_minute: int = Field(default=60, ge=1)
+    # Per-API-key cap on concurrently in-flight chat completions.
+    rate_limit_max_concurrent: int = Field(default=8, ge=1)
+    # Credit reservation hold lifetime before it is eligible for expiry release.
+    reservation_ttl_seconds: int = Field(default=900, ge=1, le=86400)
+
     @field_validator(
         "database_url", "redis_url", "litellm_master_key", "jwt_secret", "api_key_pepper"
     )

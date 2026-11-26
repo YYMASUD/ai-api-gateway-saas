@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-Phase 1 establishes a local, production-shaped topology and security boundaries. Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Phase 3 adds the credit ledger service (reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads. Service code for health/readiness, configuration, persistence models, security helpers, structured logging, auth, key management, and the credit ledger is implemented; inference routing, Stripe billing flows, and observability are later phases.
+Phase 1 establishes a local, production-shaped topology and security boundaries. Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Phase 3 adds the credit ledger service (reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads. Phase 4 wires the OpenAI-compatible `/v1` inference surface (`GET /v1/models`, `POST /v1/chat/completions` with streaming and non-streaming) through LiteLLM, adding API-key scope enforcement, request size caps, Redis-backed rate limiting, and the reserve/settle/refund lifecycle end-to-end. Service code for health/readiness, configuration, persistence models, security helpers, structured logging, auth, key management, the credit ledger, and inference routing is implemented; Stripe billing flows and observability remain later phases. LiteLLM runs **stateless** (no database, no virtual keys); provider/model selection is still pending product sign-off.
 
 This document describes the intended architecture and marks which parts are actually implemented.
 
@@ -11,11 +11,11 @@ This document describes the intended architecture and marks which parts are actu
 | Service | Runtime | Ports | Responsibility |
 | --- | --- | --- | --- |
 | `web` | Next.js 15 (standalone) | `127.0.0.1:3000` only | Public pages and dashboard shell. Holds no provider keys and no private datastore credentials. |
-| `api` | FastAPI / Python 3.12 | `127.0.0.1:8000` only | Public OpenAI-compatible gateway (planned), dashboard API and auth (implemented), health/readiness (implemented), usage/billing orchestration (planned). |
+| `api` | FastAPI / Python 3.12 | `127.0.0.1:8000` only | Public OpenAI-compatible gateway (`/v1` implemented in Phase 4), dashboard API and auth (implemented), health/readiness (implemented), usage/billing orchestration (planned). |
 | `worker` | ARQ / Python 3.12 | none | Private async jobs: usage rollup, credit settlement, webhook processing, reconciliation, email (stubs in Phase 1). |
 | `postgres` | PostgreSQL 16 | none | System of record for users, API keys, credits, usage, payments, webhooks, audit logs, and model pricing. |
-| `redis` | Redis 7 (AOF) | none | Queue backend for ARQ; Phase 2 also uses it for the 60s API-key lookup cache. Rate-limit state comes later. AOF persistence volume is enabled. |
-| `litellm` | LiteLLM proxy | none | Only outbound model gateway. Owns provider routing/fallbacks; master key required for management and proxy auth. |
+| `redis` | Redis 7 (AOF) | none | Queue backend for ARQ; API-key lookup cache (60s); Phase 4 rate-limit state (sliding window + concurrency counters, fails open on outage). AOF persistence volume is enabled. |
+| `litellm` | LiteLLM proxy (stateless) | none | Only outbound model gateway. Owns provider routing/fallbacks; master key required for proxy auth. Runs **stateless** in Phase 4: no LiteLLM database, no virtual keys, no spend store. FastAPI is authoritative for billing. |
 
 Network: a single Docker bridge network named `backend`. Only `web` and `api` publish ports. In production, TLS termination and ingress are added in front of `web`/`api`; Postgres, Redis, LiteLLM, and the worker remain private with no public listeners.
 
@@ -51,17 +51,19 @@ Rules enforced by configuration:
 4. Provider keys are injected only into the LiteLLM container from a secrets manager and referenced by `os.environ/<NAME>` in `infra/litellm/config.yaml`.
 5. `worker` has no published port and consumes only private queue/datastore URLs. In Phase 1 its job bodies are no-ops that return `{"status": "noop", "job": ...}`.
 
-## Request flow (intended Phase 2+ inference)
+## Request flow (Phase 4 inference)
 
 1. Client sends an OpenAI-compatible request to `POST /v1/chat/completions` with a gateway API key.
-2. FastAPI authenticates the key by hashing `raw_key + API_KEY_PEPPER` with SHA-256 and looking up `api_keys.key_hash` (helpers and the 60s Redis lookup cache exist as of Phase 2; the `/v1` route wiring arrives in a later phase).
-3. FastAPI checks/reserves credits using the append-only `credit_ledger`, the materialised `credit_balances`, and `credit_reservations`. Money is integer **microcredits**: `1,000,000 microcredits = 1 credit`; no floats are stored. A reserve opens a 15-minute reservation hold against `available = balance - reserved`, enforcing the per-user UTC-month spend cap; it writes a zero-amount `reservation` ledger row and increases only `reserved` (`balance` is unchanged).
-4. FastAPI calls LiteLLM over the private network with the master key, forwarding only the model alias and sanitized request fields.
-5. LiteLLM selects a configured provider deployment and calls the upstream provider. Provider credentials never leave LiteLLM.
-6. FastAPI records a `usage_events` row (idempotent on `request_id`), settles the reservation (closing it `settled`, debiting the actual cost, freeing the unused difference), and returns an OpenAI-compatible response/error. On failure the reservation is refunded/released rather than settled.
-7. Background workers roll up usage, settle credits, release expired reservations (`release_expired`), process webhook events, and send email.
+2. **Size cap and validation.** FastAPI rejects bodies above `MAX_REQUEST_BYTES` (default 1 MiB) with `413 request_too_large`, then validates the OpenAI request shape and enforces `max_tokens ≤ MAX_OUTPUT_TOKENS` (default 4096). The model must be an enabled `model_pricing` row (`404 model_not_found` otherwise).
+3. **Authentication and scope.** FastAPI authenticates the key by hashing `raw_key + API_KEY_PEPPER` with SHA-256 and looking up `api_keys.key_hash` (helpers and the 60s Redis lookup cache exist as of Phase 2; the `/v1` route wiring is implemented in Phase 4). The key must carry `chat:completions` (`403 insufficient_scope` otherwise). `GET /v1/models` uses the same authentication with required scope `models:read`.
+4. **Rate limit.** Redis enforces a per-key sliding window (`RATE_LIMIT_REQUESTS_PER_MINUTE`, default 60) and concurrent in-flight cap (`RATE_LIMIT_MAX_CONCURRENT`, default 8); a breach returns `429 rate_limit_exceeded` with `Retry-After`. Redis outage **fails open** so inference stays available; PostgreSQL credit controls still apply.
+5. **Reserve.** FastAPI checks/reserves credits using the append-only `credit_ledger`, materialised `credit_balances`, and `credit_reservations`. Money is integer **microcredits**: `1,000,000 microcredits = 1 credit`; no floats are stored. A reserve opens a `RESERVATION_TTL_SECONDS`-lived reservation (default 900s) against `available = balance - reserved`, enforcing the per-user UTC-month spend cap; it writes a zero-amount `reservation` ledger row and increases only `reserved` (`balance` is unchanged). A **1-microcredit floor** applies even to a zero estimate so zero-priced models still exercise the lifecycle.
+6. **Forward.** FastAPI calls stateless LiteLLM over the private network with the master key, forwarding the model alias and sanitized request fields. Streaming requests are proxied as unbuffered SSE.
+7. **LiteLLM routing.** LiteLLM selects a configured provider deployment and calls the upstream provider. Provider credentials never leave LiteLLM. With the approved local-only `model_list: []`, there is no routable deployment: a real inference call returns `502 upstream_error` and FastAPI fully refunds the reservation (expected local behavior).
+8. **Settle and record.** FastAPI records a `usage_events` row (idempotent on `request_id`), settles the reservation (closing it `settled`, debiting actual cost, freeing the unused difference), and returns an OpenAI-compatible response/error. On upstream failure (`502`/`504`) the reservation is refunded/released rather than settled. If a streaming client disconnects, only tokens actually produced are charged and usage status is `partial`.
+9. Background workers roll up usage, release expired reservations (`release_expired`), process webhook events, and send email; worker job bodies and scheduling are later-phase wiring.
 
-As of Phase 3, step 2 (key authentication primitives and caching) and the credit primitives behind step 3 (the credit service's reserve/settle/refund/release_expired/grant_purchase operations) are implemented; the `/v1` route wiring, usage ingestion, and worker job bodies remain contracts/TODOs. The implemented API surface is health/readiness, authentication, API-key lifecycle, and owner-only dashboard credit reads (see `docs/API.md`).
+As of Phase 4, steps 2–8 are implemented for `/v1` (size caps, validation, auth/scope, rate limiting, reservations, LiteLLM forwarding, settlement/refund, and usage events). LiteLLM remains **stateless**: FastAPI/PostgreSQL is authoritative for auth, billing, spend caps, and usage; there is no LiteLLM database and no virtual keys. Provider/model selection is still **pending product sign-off**, so local dev keeps `model_list: []` and seeds one zero-priced `gateway-default` placeholder row. The implemented API surface is health/readiness, authentication, API-key lifecycle, owner-only dashboard credit reads, and `/v1` (see `docs/API.md`). Stripe billing/webhooks, worker job bodies, usage dashboards, and observability remain later-phase work.
 
 ## Data model (Phase 1–3 schema)
 
@@ -76,7 +78,7 @@ The Phase 1/2/3 Alembic revisions (`0001_initial`, `0002_user_password_hash`, `0
 - `payments`: provider payment/checkout references and amounts.
 - `webhook_events`: provider event id, payload, status, attempts, and errors.
 - `audit_logs`: actor/action/resource metadata.
-- `model_pricing`: active input/output prices per 1,000 tokens in microcredits.
+- `model_pricing`: active input/output prices per 1,000 tokens in microcredits. Local dev seeds one placeholder row `gateway-default` at 0 microcredits per 1k input/output tokens; `GET /v1/models` lists enabled rows.
 
 Database access is async SQLAlchemy 2.x with `asyncpg`. Alembic uses the same `DATABASE_URL` from settings.
 
@@ -134,6 +136,16 @@ Terraform will own networking, managed data services, runtime services, IAM, rem
 - The monthly spend cap moved to `users.spend_cap_monthly_microcredits` (BIGINT, 0 = disabled) and is enforced on reserve over the UTC calendar month; `spend_cap_monthly_cents` remains the fiat/Stripe value.
 - Dashboard credit reads are owner-only (JWT `sub`); admin reconciliation/rebuild tooling is deferred to a later phase.
 
+## Decisions in Phase 4
+
+- LiteLLM runs **stateless**: no `database_url`, no `store_model_in_db`, no virtual keys. FastAPI (with PostgreSQL) is authoritative for authentication, billing, spend caps, and usage metering.
+- Local-only defaults: no real upstream provider is selected yet. `model_list` stays empty and local dev seeds one zero-priced `gateway-default` placeholder pricing row; real inference calls return `502 upstream_error` with a full reservation refund until a provider is approved.
+- The `/v1` pipeline order is fixed: size cap → validation → rate limit → reserve → forward → settle/refund → `usage_events`.
+- A 1-microcredit reservation floor applies even when the estimate is 0, so zero-priced models exercise the full reservation lifecycle; settlement charges the true cost and releases the hold.
+- Rate limiting is Redis-backed per key (sliding window + concurrent in-flight cap) and deliberately **fails open** on Redis outage; PostgreSQL-backed credit checks still apply.
+- Streaming is proxied as unbuffered SSE; a client disconnect charges only tokens actually produced (`usage_events.status = partial`).
+- LiteLLM `request_timeout` (300s) matches the gateway `HTTP_READ_TIMEOUT` so the gateway owns the client-visible timeout.
+
 ## Decisions in Phase 1
 
 - One private network (`backend`) is enough for local topology; do not mark it `internal: true` because LiteLLM needs outbound access to upstream providers.
@@ -145,8 +157,8 @@ Terraform will own networking, managed data services, runtime services, IAM, rem
 
 ## Later-phase TODOs
 
-- Implement and test inference (`/v1`) auth wiring, billing, and usage ingestion.
-- Decide whether LiteLLM uses its own database for virtual keys/spend or remains stateless with FastAPI authoritative.
+- Wire Stripe billing (`/billing/*`, `/webhooks/*`), usage dashboards/rollups, and worker job bodies (expiry sweeps, webhook processing, email).
+- Select upstream providers/models and public aliases (pending product sign-off), then populate LiteLLM `model_list` and real `model_pricing` rows.
 - Add migrations for any new tables and a backward-compatible migration policy.
 - Add deployment manifests/Terraform, private ingress, TLS, and secret-manager wiring.
 - Add metrics, dashboards, alert routing, SLOs, and runbooks for production incidents.
