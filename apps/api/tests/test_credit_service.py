@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
@@ -20,9 +21,13 @@ from app.core.errors import (
 from app.db.models import CreditBalance, CreditLedger, CreditReservation, User
 from app.services.credit_service import (
     BIGINT_MAX,
+    MAX_RESERVATION_TTL_SECONDS,
+    AmountTooLargeError,
     CreditService,
+    InvalidReservationTTLError,
     ReserveRequest,
     SQLAlchemyCreditRepository,
+    utc_month_bounds,
 )
 from tests.fakes import make_user
 
@@ -79,9 +84,11 @@ class FakeCreditRepository:
         self.events.append("reservation_lock")
         return self.reservations.get(reservation_id)
 
-    async def get_reservation_by_request_id(self, request_id: str) -> CreditReservation | None:
+    async def get_reservation_by_request_id(
+        self, *, user_id: uuid.UUID, request_id: str
+    ) -> CreditReservation | None:
         for reservation in self.reservations.values():
-            if reservation.request_id == request_id:
+            if reservation.user_id == user_id and reservation.request_id == request_id:
                 return reservation
         return None
 
@@ -218,7 +225,9 @@ async def test_reserve_moves_available_into_reserved_only() -> None:
     entry = repo.ledgers[0]
     assert entry.type == "reservation"
     assert entry.amount_microcredits == 0
-    assert entry.idempotency_key == "reserve:req-1"
+    assert entry.idempotency_key.startswith("reserve:")
+    assert entry.idempotency_key != "reserve:req-1"
+    assert len(entry.idempotency_key) <= 128
     assert entry.metadata_json["reservation_id"] == str(reservation.id)
 
 
@@ -333,6 +342,33 @@ async def test_reserve_idempotent_replay_returns_same_reservation() -> None:
     assert len(repo.ledgers) == 1
 
 
+async def test_two_users_can_reserve_the_same_request_id() -> None:
+    owner = make_user()
+    other = make_user(email="other-reserve@example.com")
+    repo = FakeCreditRepository()
+    repo.register_user(owner)
+    repo.register_user(other)
+    owner_balance = repo.seed_balance(owner.id, 1000)
+    other_balance = repo.seed_balance(other.id, 1000)
+    service = CreditService(repo)
+
+    first = await service.reserve(
+        None, user_id=owner.id, amount_microcredits=100, request_id="shared-request"
+    )
+    second = await service.reserve(
+        None, user_id=other.id, amount_microcredits=200, request_id="shared-request"
+    )
+
+    assert first.id != second.id
+    assert first.user_id == owner.id
+    assert second.user_id == other.id
+    assert owner_balance.reserved == 100
+    assert other_balance.reserved == 200
+    assert len(repo.ledgers) == 2
+    assert len({entry.idempotency_key for entry in repo.ledgers}) == 2
+    assert len({entry.reference_id for entry in repo.ledgers}) == 1
+
+
 async def test_reserve_idempotency_conflict_different_amount() -> None:
     user = make_user()
     repo = FakeCreditRepository()
@@ -417,6 +453,119 @@ async def test_reserve_rejects_invalid_amounts(amount: object) -> None:
             amount_microcredits=amount,  # type: ignore[arg-type]
             request_id="req-bad",
         )
+
+
+@pytest.mark.parametrize("ttl", [MAX_RESERVATION_TTL_SECONDS + 1, BIGINT_MAX + 1, 10**30])
+async def test_reserve_rejects_ttl_above_one_day(ttl: int) -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, 1000)
+    service = CreditService(repo)
+
+    with pytest.raises(InvalidReservationTTLError) as exc:
+        await service.reserve(
+            None,
+            user_id=user.id,
+            amount_microcredits=100,
+            request_id=f"req-ttl-{ttl}",
+            expires_in_seconds=ttl,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.code == "invalid_ttl"
+    assert balance.reserved == 0
+    assert repo.reservations == {}
+    assert repo.ledgers == []
+
+
+async def test_reserve_accepts_max_ttl_without_datetime_overflow() -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    repo.seed_balance(user.id, 1000)
+    service = CreditService(repo)
+
+    reservation = await service.reserve(
+        None,
+        user_id=user.id,
+        amount_microcredits=100,
+        request_id="req-ttl-max",
+        expires_in_seconds=MAX_RESERVATION_TTL_SECONDS,
+    )
+
+    assert reservation.status == "open"
+    assert reservation.expires_at > datetime.now(UTC)
+    assert reservation.expires_at < datetime.now(UTC) + timedelta(days=2)
+
+
+async def test_reserve_replay_ignores_ttl_and_keeps_original_expiry() -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, 1000)
+    service = CreditService(repo)
+
+    first = await service.reserve(
+        None,
+        user_id=user.id,
+        amount_microcredits=100,
+        request_id="req-ttl-replay",
+        expires_in_seconds=60,
+    )
+    second = await service.reserve(
+        None,
+        user_id=user.id,
+        amount_microcredits=100,
+        request_id="req-ttl-replay",
+        expires_in_seconds=MAX_RESERVATION_TTL_SECONDS,
+    )
+
+    assert second.id == first.id
+    assert second.expires_at == first.expires_at
+    assert balance.reserved == 100
+    assert len(repo.ledgers) == 1
+
+
+@pytest.mark.parametrize(
+    ("balance", "reserved", "amount"),
+    [(BIGINT_MAX, BIGINT_MAX - 10, 20), (BIGINT_MAX, BIGINT_MAX, 1)],
+)
+async def test_reserve_rejects_reserved_overflow(balance: int, reserved: int, amount: int) -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    row = repo.seed_balance(user.id, balance, reserved=reserved)
+    service = CreditService(repo)
+
+    with pytest.raises(AmountTooLargeError) as exc:
+        await service.reserve(
+            None,
+            user_id=user.id,
+            amount_microcredits=amount,
+            request_id="req-reserved-overflow",
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.code == "amount_too_large"
+    assert row.reserved == reserved
+    assert repo.reservations == {}
+    assert repo.ledgers == []
+
+
+async def test_reserve_allows_balance_exactly_at_bigint_max() -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    row = repo.seed_balance(user.id, BIGINT_MAX)
+    service = CreditService(repo)
+
+    reservation = await service.reserve(
+        None,
+        user_id=user.id,
+        amount_microcredits=BIGINT_MAX,
+        request_id="req-bigint-exact",
+    )
+    assert reservation.status == "open"
+    assert row.reserved == BIGINT_MAX
 
 
 async def test_reserve_rejects_amount_above_bigint_max() -> None:
@@ -672,6 +821,31 @@ async def test_settle_rejects_invalid_cost(cost: object) -> None:
         )
 
 
+async def test_settle_rejects_lifetime_spent_overflow_before_mutating() -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, 1000)
+    balance.lifetime_spent_microcredits = BIGINT_MAX - 1
+    service = CreditService(repo)
+    reservation = await _reserve(repo, user, 100, "req-spent-overflow")
+
+    with pytest.raises(AmountTooLargeError) as exc:
+        await service.settle(
+            None,
+            reservation_id=reservation.id,
+            cost_microcredits=10,
+            request_id="settle-spent-overflow",
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.code == "amount_too_large"
+    assert balance.balance == 1000
+    assert balance.reserved == 100
+    assert balance.lifetime_spent_microcredits == BIGINT_MAX - 1
+    assert reservation.status == "open"
+    assert len(repo.ledgers) == 1  # only the original reservation row
+
+
 # ---------------------------------------------------------------------------
 # refund / expiry
 # ---------------------------------------------------------------------------
@@ -851,7 +1025,8 @@ async def test_grant_purchase_increments_balance_and_lifetime() -> None:
 
     assert ledger.type == "purchase"
     assert ledger.amount_microcredits == 5000
-    assert ledger.idempotency_key == "purchase:stripe-session-123"
+    assert ledger.idempotency_key == "ext-key-123"
+    assert ledger.metadata_json["reference_id"] == "stripe-session-123"
     balance = await repo.get_balance(user.id)
     assert balance is not None
     assert balance.balance == 5000
@@ -883,6 +1058,148 @@ async def test_grant_purchase_idempotent_replay() -> None:
     balance = await repo.get_balance(user.id)
     assert balance is not None
     assert balance.balance == 5000
+
+
+async def test_grant_purchase_same_key_different_reference_is_409() -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, 0)
+    service = CreditService(repo)
+
+    await service.grant_purchase(
+        None,
+        user_id=user.id,
+        amount_microcredits=5000,
+        reference_id="ref-first",
+        idempotency_key="caller-key-1",
+    )
+    with pytest.raises(IdempotencyConflictError) as exc:
+        await service.grant_purchase(
+            None,
+            user_id=user.id,
+            amount_microcredits=5000,
+            reference_id="ref-second",
+            idempotency_key="caller-key-1",
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.code == "idempotency_conflict"
+    assert balance.balance == 5000
+    assert balance.lifetime_purchased_microcredits == 5000
+    assert len(repo.ledgers) == 1
+    assert repo.ledgers[0].reference_id == "ref-first"
+
+
+async def test_grant_purchase_different_key_same_reference_is_new_grant() -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, 0)
+    service = CreditService(repo)
+
+    first = await service.grant_purchase(
+        None,
+        user_id=user.id,
+        amount_microcredits=5000,
+        reference_id="shared-ref",
+        idempotency_key="key-one",
+    )
+    second = await service.grant_purchase(
+        None,
+        user_id=user.id,
+        amount_microcredits=5000,
+        reference_id="shared-ref",
+        idempotency_key="key-two",
+    )
+
+    assert second.id != first.id
+    assert [entry.idempotency_key for entry in repo.ledgers] == ["key-one", "key-two"]
+    assert balance.balance == 10_000
+    assert balance.lifetime_purchased_microcredits == 10_000
+
+
+async def test_grant_purchase_same_key_different_user_is_409() -> None:
+    user = make_user()
+    other = make_user(email="other-purchase@example.com")
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    repo.register_user(other)
+    repo.seed_balance(user.id, 0)
+    other_balance = repo.seed_balance(other.id, 0)
+    service = CreditService(repo)
+    await service.grant_purchase(
+        None,
+        user_id=user.id,
+        amount_microcredits=5000,
+        reference_id="ref-owner",
+        idempotency_key="caller-key-2",
+    )
+
+    with pytest.raises(IdempotencyConflictError) as exc:
+        await service.grant_purchase(
+            None,
+            user_id=other.id,
+            amount_microcredits=5000,
+            reference_id="ref-owner",
+            idempotency_key="caller-key-2",
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.code == "idempotency_conflict"
+    assert other_balance.balance == 0
+    assert other_balance.lifetime_purchased_microcredits == 0
+    assert len(repo.ledgers) == 1
+
+
+class SerializedCreditRepository(FakeCreditRepository):
+    """Models the Postgres user-row lock: ``lock_user`` serializes calls.
+
+    The service releases the simulated transaction lock when it returns from
+    its public method, matching the caller-owned ``session`` boundary.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._user_locks: dict[uuid.UUID, asyncio.Lock] = {}
+
+    async def lock_user(self, user_id: uuid.UUID) -> User | None:
+        await self._user_locks.setdefault(user_id, asyncio.Lock()).acquire()
+        return await super().lock_user(user_id)
+
+    def release_user_locks(self) -> None:
+        for lock in self._user_locks.values():
+            if lock.locked():
+                lock.release()
+
+
+async def test_grant_purchase_same_key_concurrently_credits_once() -> None:
+    """A unit-level same-key race must produce one ledger row and one credit."""
+    user = make_user()
+    repo = SerializedCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, 0)
+    service = CreditService(repo)
+    barrier = asyncio.Barrier(10)
+
+    async def grant() -> CreditLedger:
+        await barrier.wait()
+        try:
+            return await service.grant_purchase(
+                None,
+                user_id=user.id,
+                amount_microcredits=500,
+                reference_id="concurrent-ref",
+                idempotency_key="concurrent-caller-key",
+            )
+        finally:
+            repo.release_user_locks()
+
+    entries = await asyncio.gather(*(grant() for _ in range(10)))
+
+    assert len({entry.id for entry in entries}) == 1
+    assert balance.balance == 500
+    assert balance.lifetime_purchased_microcredits == 500
+    assert len(repo.ledgers) == 1
+    assert repo.ledgers[0].idempotency_key == "concurrent-caller-key"
 
 
 async def test_grant_purchase_conflicting_amount_is_conflict() -> None:
@@ -923,6 +1240,54 @@ async def test_grant_purchase_rejects_invalid_amount(amount: object) -> None:
             reference_id="ref-bad",
             idempotency_key="idem-bad",
         )
+
+
+@pytest.mark.parametrize("field", ["balance", "lifetime_purchased_microcredits"])
+async def test_grant_purchase_rejects_bigint_overflow_before_mutating(field: str) -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, BIGINT_MAX)
+    balance.lifetime_purchased_microcredits = BIGINT_MAX
+    setattr(balance, field, BIGINT_MAX - 1)
+    original_balance = balance.balance
+    original_lifetime = balance.lifetime_purchased_microcredits
+    service = CreditService(repo)
+
+    with pytest.raises(AmountTooLargeError) as exc:
+        await service.grant_purchase(
+            None,
+            user_id=user.id,
+            amount_microcredits=10,
+            reference_id="overflow-ref",
+            idempotency_key="overflow-key",
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.code == "amount_too_large"
+    assert balance.balance == original_balance
+    assert balance.lifetime_purchased_microcredits == original_lifetime
+    assert repo.ledgers == []
+
+
+async def test_grant_purchase_allows_exact_bigint_max() -> None:
+    user = make_user()
+    repo = FakeCreditRepository()
+    repo.register_user(user)
+    balance = repo.seed_balance(user.id, BIGINT_MAX - 10)
+    balance.lifetime_purchased_microcredits = BIGINT_MAX - 10
+    service = CreditService(repo)
+
+    ledger = await service.grant_purchase(
+        None,
+        user_id=user.id,
+        amount_microcredits=10,
+        reference_id="exact-max",
+        idempotency_key="exact-max",
+    )
+
+    assert ledger.amount_microcredits == 10
+    assert balance.balance == BIGINT_MAX
+    assert balance.lifetime_purchased_microcredits == BIGINT_MAX
 
 
 async def test_reconcile_user_consistent_with_ledger() -> None:
@@ -1119,17 +1484,56 @@ async def test_repository_lock_user_uses_for_update() -> None:
     assert "FOR UPDATE" in _sql(session.statements[0])
 
 
-async def test_repository_month_settled_spend_uses_date_trunc() -> None:
+async def test_repository_month_settled_spend_uses_utc_month_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 11, 26, 23, 59, 59, tzinfo=UTC)
+    monkeypatch.setattr(
+        "app.services.credit_service.datetime",
+        type(
+            "FrozenDatetime",
+            (datetime,),
+            {"now": staticmethod(lambda _tz=None: now)},
+        ),
+    )
     session = RecordingSession([_StubResult(scalar=123)])
     repo = SQLAlchemyCreditRepository(session)  # type: ignore[arg-type]
 
     spend = await repo.month_settled_spend(uuid.uuid4())
 
     assert spend == 123
-    sql = _sql(session.statements[0])
-    assert "date_trunc('month', now())" in sql
-    assert "interval '1 month'" in sql
+    statement = session.statements[0]
+    sql = _sql(statement)
+    assert "date_trunc" not in sql
+    assert "now()" not in sql
     assert "settlement" in sql
+    params = statement.compile().params
+    assert params["created_at_1"] == datetime(2026, 11, 1, tzinfo=UTC)
+    assert params["created_at_2"] == datetime(2026, 12, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("now", "month_start", "next_month"),
+    [
+        (
+            datetime(2026, 11, 26, 23, 59, tzinfo=UTC),
+            datetime(2026, 11, 1, tzinfo=UTC),
+            datetime(2026, 12, 1, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 12, 31, 23, 59, tzinfo=UTC),
+            datetime(2026, 12, 1, tzinfo=UTC),
+            datetime(2027, 1, 1, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 2, 1, tzinfo=UTC),
+            datetime(2026, 2, 1, tzinfo=UTC),
+            datetime(2026, 3, 1, tzinfo=UTC),
+        ),
+    ],
+)
+def test_utc_month_bounds(now: datetime, month_start: datetime, next_month: datetime) -> None:
+    assert utc_month_bounds(now) == (month_start, next_month)
 
 
 async def test_repository_list_ledger_keyset_cursor() -> None:
@@ -1208,8 +1612,22 @@ async def test_repository_getters_delegate() -> None:
     assert await repo.get_balance(user_id) is None
     assert await repo.get_reservation(uuid.uuid4()) is reservation
     assert await repo.get_reservation_for_update(uuid.uuid4()) is reservation
-    assert await repo.get_reservation_by_request_id("req") is reservation
+    assert (
+        await repo.get_reservation_by_request_id(user_id=user_id, request_id="req") is reservation
+    )
     assert await repo.get_ledger_by_idempotency_key("key") is key
+
+
+async def test_repository_reservation_lookup_is_user_scoped() -> None:
+    session = RecordingSession([_StubResult(scalar=None)])
+    repo = SQLAlchemyCreditRepository(session)  # type: ignore[arg-type]
+    user_id = uuid.uuid4()
+
+    assert await repo.get_reservation_by_request_id(user_id=user_id, request_id="req") is None
+
+    sql = _sql(session.statements[0])
+    assert "credit_reservations.user_id" in sql
+    assert "credit_reservations.request_id" in sql
 
 
 async def test_repository_mutations_and_flush_delegate() -> None:

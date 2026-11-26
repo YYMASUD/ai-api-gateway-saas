@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
 
@@ -19,14 +20,24 @@ def _config() -> Config:
     return config
 
 
-def _offline_upgrade(capsys) -> str:
+def _offline_upgrade(capsys: pytest.CaptureFixture[str]) -> str:
     command.upgrade(_config(), "head", sql=True)
     return capsys.readouterr().out
 
 
-def _offline_phase3_downgrade(capsys) -> str:
+def _offline_phase3_downgrade(capsys: pytest.CaptureFixture[str]) -> str:
     # Only render 0003 -> 0002; offline mode never connects to PostgreSQL.
-    command.downgrade(_config(), "head:0002_user_password_hash", sql=True)
+    command.downgrade(_config(), "0003_credit_reservations:0002_user_password_hash", sql=True)
+    return capsys.readouterr().out
+
+
+def _offline_phase4_upgrade(capsys: pytest.CaptureFixture[str]) -> str:
+    command.upgrade(_config(), "0003_credit_reservations:head", sql=True)
+    return capsys.readouterr().out
+
+
+def _offline_phase4_downgrade(capsys: pytest.CaptureFixture[str]) -> str:
+    command.downgrade(_config(), "head:0003_credit_reservations", sql=True)
     return capsys.readouterr().out
 
 
@@ -120,9 +131,39 @@ def test_phase3_adds_user_microcredit_cap(capsys) -> None:
 
 
 def test_phase3_upgrade_drops_nothing(capsys) -> None:
-    sql = _offline_upgrade(capsys)
+    sql = _offline_phase4_upgrade(capsys)
+    # 0004 changes only a constraint; the Phase 3 migration itself never
+    # drops tables or columns, including when followed by 0004.
     assert "DROP TABLE" not in sql
     assert "DROP COLUMN" not in sql
+
+
+def test_phase4_revision_id_fits_alembic_version_column() -> None:
+    from alembic.script import ScriptDirectory
+
+    scripts = ScriptDirectory.from_config(_config())
+    head = scripts.get_revision("head")
+    assert head is not None
+    assert head.revision == "0004_request_id_per_user"
+    assert len(head.revision) <= 32
+    assert head.down_revision == "0003_credit_reservations"
+
+
+def test_phase4_upgrade_scopes_request_id_unique_per_user(capsys) -> None:
+    sql = _offline_phase4_upgrade(capsys)
+    assert "-- Running upgrade 0003_credit_reservations -> 0004_request_id_per_user" in sql
+    assert "DROP CONSTRAINT uq_credit_reservations_request_id" in sql
+    assert (
+        "ADD CONSTRAINT uq_credit_reservations_user_id_request_id "
+        "UNIQUE (user_id, request_id)" in sql
+    )
+
+
+def test_phase4_downgrade_restores_global_request_id_unique(capsys) -> None:
+    sql = _offline_phase4_downgrade(capsys)
+    assert "-- Running downgrade 0004_request_id_per_user -> 0003_credit_reservations" in sql
+    assert "DROP CONSTRAINT uq_credit_reservations_user_id_request_id" in sql
+    assert "ADD CONSTRAINT uq_credit_reservations_request_id UNIQUE (request_id)" in sql
 
 
 def test_phase3_downgrade_drops_only_new_objects(capsys) -> None:

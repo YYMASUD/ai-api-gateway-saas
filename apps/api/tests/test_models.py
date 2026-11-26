@@ -225,7 +225,8 @@ def test_key_uniques_and_indexes() -> None:
     assert frozenset({"request_id"}) in _unique_constraint_columns("usage_events")
     assert frozenset({"model_id"}) in _unique_constraint_columns("model_pricing")
     assert frozenset({"user_id"}) in _unique_constraint_columns("credit_balances")
-    assert frozenset({"request_id"}) in _unique_constraint_columns("credit_reservations")
+    assert frozenset({"user_id", "request_id"}) in _unique_constraint_columns("credit_reservations")
+    assert frozenset({"request_id"}) not in _unique_constraint_columns("credit_reservations")
     assert frozenset({"idempotency_key"}) in _unique_constraint_columns("credit_ledger")
     assert frozenset({"stripe_session_id"}) in _unique_constraint_columns("payments")
     assert frozenset({"stripe_event_id"}) in _unique_constraint_columns("webhook_events")
@@ -255,6 +256,12 @@ def test_credit_reservation_fields_and_constraints() -> None:
     index_names = {index.name for index in table.indexes}
     assert "ix_credit_reservations_status_expires_at" in index_names
     assert "ix_credit_reservations_user_id_created_at" in index_names
+    named_uniques = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert named_uniques == {"uq_credit_reservations_user_id_request_id": ("user_id", "request_id")}
 
 
 def test_users_microcredit_spend_cap_column() -> None:

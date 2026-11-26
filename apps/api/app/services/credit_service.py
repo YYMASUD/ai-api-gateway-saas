@@ -33,11 +33,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import (
+    APIError,
     IdempotencyConflictError,
     InsufficientCreditsError,
     MonthlySpendCapExceededError,
@@ -48,19 +49,39 @@ from app.db.models import CreditBalance, CreditLedger, CreditReservation, User
 
 BIGINT_MAX = 2**63 - 1
 DEFAULT_RESERVATION_TTL_SECONDS = 900
+# Hard ceiling so ``now + timedelta(seconds=ttl)`` can never overflow and a
+# hold cannot linger indefinitely.
+MAX_RESERVATION_TTL_SECONDS = 86400
 
 __all__ = [
     "BIGINT_MAX",
+    "MAX_RESERVATION_TTL_SECONDS",
+    "AmountTooLargeError",
     "CreditRepository",
     "CreditService",
     "IdempotencyConflictError",
     "InsufficientCreditsError",
+    "InvalidReservationTTLError",
     "MonthlySpendCapExceededError",
     "ReservationExpiredError",
     "ReservationNotFoundError",
     "ReserveRequest",
     "SQLAlchemyCreditRepository",
 ]
+
+
+class AmountTooLargeError(APIError):
+    """A mutation would push a BIGINT money column past its storage range."""
+
+    status_code = 422
+    code = "amount_too_large"
+
+
+class InvalidReservationTTLError(APIError):
+    """``expires_in_seconds`` is outside the allowed 0..86400 range."""
+
+    status_code = 422
+    code = "invalid_ttl"
 
 
 @dataclass(frozen=True)
@@ -90,6 +111,29 @@ def _ensure_int(value: object, *, name: str, minimum: int) -> int:
     return value
 
 
+def _checked_add(current: int, delta: int, *, name: str) -> int:
+    """Return ``current + delta`` or raise a 422 when it would overflow BIGINT.
+
+    BIGINT columns cannot represent the result, so the operation is refused
+    before any row is mutated instead of letting the database raise.
+    """
+    total = current + delta
+    if total > BIGINT_MAX or total < -BIGINT_MAX - 1:
+        raise AmountTooLargeError(f"{name} would overflow the BIGINT range")
+    return total
+
+
+def utc_month_bounds(now: datetime) -> tuple[datetime, datetime]:
+    """Return the half-open UTC calendar-month window containing ``now``.
+
+    Computed in Python (never via ``date_trunc``) so the monthly spend cap
+    does not depend on the database session time zone.
+    """
+    month_start = now.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    return month_start, next_month
+
+
 class CreditRepository(Protocol):
     """Persistence boundary; implemented by SQLAlchemy and by test fakes."""
 
@@ -105,7 +149,9 @@ class CreditRepository(Protocol):
         self, reservation_id: uuid.UUID
     ) -> CreditReservation | None: ...
 
-    async def get_reservation_by_request_id(self, request_id: str) -> CreditReservation | None: ...
+    async def get_reservation_by_request_id(
+        self, *, user_id: uuid.UUID, request_id: str
+    ) -> CreditReservation | None: ...
 
     async def create_reservation(self, reservation: CreditReservation) -> None: ...
 
@@ -170,16 +216,27 @@ class SQLAlchemyCreditRepository:
     async def get_reservation_for_update(
         self, reservation_id: uuid.UUID
     ) -> CreditReservation | None:
+        # ``populate_existing`` is required: a plain probe SELECT earlier in the
+        # same session identity-maps the row, and without it the FOR UPDATE
+        # re-select would return stale attributes after a concurrent commit.
         result = await self._session.execute(
             select(CreditReservation)
             .where(CreditReservation.id == reservation_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
-    async def get_reservation_by_request_id(self, request_id: str) -> CreditReservation | None:
+    async def get_reservation_by_request_id(
+        self, *, user_id: uuid.UUID, request_id: str
+    ) -> CreditReservation | None:
+        # ``request_id`` is unique per user, not globally, so the lookup must
+        # always be scoped by the owning user.
         result = await self._session.execute(
-            select(CreditReservation).where(CreditReservation.request_id == request_id)
+            select(CreditReservation).where(
+                CreditReservation.user_id == user_id,
+                CreditReservation.request_id == request_id,
+            )
         )
         return result.scalar_one_or_none()
 
@@ -196,8 +253,9 @@ class SQLAlchemyCreditRepository:
         return result.scalar_one_or_none()
 
     async def month_settled_spend(self, user_id: uuid.UUID) -> int:
-        month_start = text("date_trunc('month', now())")
-        next_month = text("date_trunc('month', now()) + interval '1 month'")
+        # UTC month boundaries are computed in Python and bound as parameters
+        # so the cap is independent of the PostgreSQL session time zone.
+        month_start, next_month = utc_month_bounds(datetime.now(UTC))
         result = await self._session.execute(
             select(func.coalesce(func.sum(-CreditLedger.amount_microcredits), 0)).where(
                 CreditLedger.user_id == user_id,
@@ -305,15 +363,35 @@ class CreditService:
         api_key_id: uuid.UUID | None = None,
         expires_in_seconds: int = DEFAULT_RESERVATION_TTL_SECONDS,
     ) -> CreditReservation:
+        """Create (or replay) a credit hold.
+
+        Idempotency is keyed on ``(user_id, request_id)``: two users may hold
+        reservations with the same ``request_id`` independently. The replay
+        fingerprint is ``(user_id, amount_microcredits, api_key_id)``;
+        ``expires_in_seconds`` is deliberately NOT part of it — a retry
+        returns the original reservation with its original ``expires_at`` and
+        never shortens or extends the hold. TTLs above
+        ``MAX_RESERVATION_TTL_SECONDS`` are rejected with 422 ``invalid_ttl``.
+        """
         amount = _ensure_int(amount_microcredits, name="amount_microcredits", minimum=1)
-        ttl = _ensure_int(expires_in_seconds, name="expires_in_seconds", minimum=0)
+        # Validate the TTL cap before the BIGINT range check so any value above
+        # one day (even astronomically large ints) is a clean 422 invalid_ttl.
+        if isinstance(expires_in_seconds, bool) or not isinstance(expires_in_seconds, int):
+            raise ValueError("expires_in_seconds must be an integer")
+        if expires_in_seconds < 0:
+            raise ValueError("expires_in_seconds must be >= 0")
+        ttl = expires_in_seconds
+        if ttl > MAX_RESERVATION_TTL_SECONDS:
+            raise InvalidReservationTTLError(
+                f"expires_in_seconds must be <= {MAX_RESERVATION_TTL_SECONDS}"
+            )
         repo = self._repo(session)
 
         # Lock order: users -> balances -> reservations.
         user = await repo.lock_user(user_id)
 
         # Idempotency is rechecked only after the user lock is held.
-        existing = await repo.get_reservation_by_request_id(request_id)
+        existing = await repo.get_reservation_by_request_id(user_id=user_id, request_id=request_id)
         if existing is not None:
             if (
                 existing.user_id != user_id
@@ -326,6 +404,9 @@ class CreditService:
             return existing
 
         balance = await repo.get_or_create_balance(user_id)
+
+        # Refuse a hold that could not be stored before touching any row.
+        new_reserved = _checked_add(balance.reserved, amount, name="reserved_microcredits")
 
         cap = user.spend_cap_monthly_microcredits if user is not None else 0
         if cap is None:
@@ -341,7 +422,7 @@ class CreditService:
 
         now = _utcnow()
         # Only the hold changes; ``balance`` stays the total unspent wallet.
-        balance.reserved += amount
+        balance.reserved = new_reserved
         balance.updated_at = now
 
         reservation = CreditReservation(
@@ -366,7 +447,12 @@ class CreditService:
                 type="reservation",
                 amount_microcredits=0,
                 reference_id=request_id,
-                idempotency_key=f"reserve:{request_id}",
+                # The ledger key is globally unique, so derive a stable,
+                # length-bounded key from the user and request id. A bare
+                # ``reserve:{request_id}`` would collide across users.
+                idempotency_key=(
+                    f"reserve:{uuid.uuid5(uuid.NAMESPACE_URL, f'{user_id}:{request_id}')}"
+                ),
                 metadata_json={"reservation_id": str(reservation.id)},
                 created_at=now,
                 updated_at=now,
@@ -415,10 +501,17 @@ class CreditService:
             raise ReservationExpiredError("reservation expired before settlement")
 
         amount = reservation.amount_microcredits
+        # Validate every resulting BIGINT before mutating the locked row so a
+        # rejected settlement leaves the wallet untouched.
+        new_reserved = _checked_add(balance.reserved, -amount, name="reserved_microcredits")
+        new_balance = _checked_add(balance.balance, -cost, name="balance_microcredits")
+        new_lifetime_spent = _checked_add(
+            balance.lifetime_spent_microcredits, cost, name="lifetime_spent_microcredits"
+        )
         # Charge ``cost`` from the total wallet and drop the whole hold.
-        balance.reserved -= amount
-        balance.balance -= cost
-        balance.lifetime_spent_microcredits += cost
+        balance.reserved = new_reserved
+        balance.balance = new_balance
+        balance.lifetime_spent_microcredits = new_lifetime_spent
         balance.updated_at = now
 
         reservation.status = "settled"
@@ -477,7 +570,7 @@ class CreditService:
         now = _utcnow()
         amount = reservation.amount_microcredits
         # Releasing a hold only lowers ``reserved``; ``balance`` is unchanged.
-        balance.reserved -= amount
+        balance.reserved = _checked_add(balance.reserved, -amount, name="reserved_microcredits")
         balance.updated_at = now
 
         reservation.status = "released"
@@ -517,7 +610,7 @@ class CreditService:
                 continue
             amount = reservation.amount_microcredits
             # Expiry releases the hold; ``balance`` (total unspent) is unchanged.
-            balance.reserved -= amount
+            balance.reserved = _checked_add(balance.reserved, -amount, name="reserved_microcredits")
             balance.updated_at = now
 
             reservation.status = "released"
@@ -554,22 +647,48 @@ class CreditService:
         reference_id: str,
         idempotency_key: str,
     ) -> CreditLedger:
+        """Credit a purchase, keyed by the caller's idempotency key verbatim.
+
+        The replay fingerprint is ``(user_id, amount_microcredits,
+        reference_id)``. The same key with the same fingerprint returns the
+        original ledger row without crediting again; the same key with any
+        different fingerprinted field raises ``IdempotencyConflictError``
+        (409). A different key is a new logical grant even when the reference
+        is unchanged.
+        """
         amount = _ensure_int(amount_microcredits, name="amount_microcredits", minimum=1)
-        key = f"purchase:{reference_id}"
+        key = idempotency_key
         repo = self._repo(session)
 
+        # The user lock serializes purchases for one wallet; the database
+        # uniqueness constraint on the caller-supplied ledger key protects the
+        # cross-transaction replay contract as well.
         await repo.lock_user(user_id)
         balance = await repo.get_or_create_balance(user_id)
 
         existing = await repo.get_ledger_by_idempotency_key(key)
         if existing is not None:
-            if existing.user_id != user_id or existing.amount_microcredits != amount:
-                raise IdempotencyConflictError("reference_id already used for a different purchase")
+            if (
+                existing.user_id != user_id
+                or existing.amount_microcredits != amount
+                or existing.reference_id != reference_id
+            ):
+                raise IdempotencyConflictError(
+                    "idempotency_key already used for a different purchase"
+                )
             return existing
 
+        # Validate every changing BIGINT before mutating the locked row.
+        new_balance = _checked_add(balance.balance, amount, name="balance_microcredits")
+        new_lifetime_purchased = _checked_add(
+            balance.lifetime_purchased_microcredits,
+            amount,
+            name="lifetime_purchased_microcredits",
+        )
+
         now = _utcnow()
-        balance.balance += amount
-        balance.lifetime_purchased_microcredits += amount
+        balance.balance = new_balance
+        balance.lifetime_purchased_microcredits = new_lifetime_purchased
         balance.updated_at = now
 
         ledger = CreditLedger(
@@ -579,7 +698,7 @@ class CreditService:
             amount_microcredits=amount,
             reference_id=reference_id,
             idempotency_key=key,
-            metadata_json={"external_idempotency_key": idempotency_key},
+            metadata_json={"reference_id": reference_id, "external_idempotency_key": key},
             created_at=now,
             updated_at=now,
         )

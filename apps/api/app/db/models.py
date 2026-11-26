@@ -372,7 +372,11 @@ class CreditReservation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "credit_reservations"
     __table_args__ = (
-        UniqueConstraint("request_id", name="uq_credit_reservations_request_id"),
+        UniqueConstraint(
+            "user_id",
+            "request_id",
+            name="uq_credit_reservations_user_id_request_id",
+        ),
         CheckConstraint("status IN ('open', 'settled', 'released')", name="status_valid"),
         CheckConstraint("amount_microcredits > 0", name="amount_positive"),
         CheckConstraint(

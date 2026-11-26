@@ -64,6 +64,17 @@ are used:
 
 Additional details:
 
+- `grant_purchase` uses the caller-supplied `idempotency_key` verbatim as the
+  ledger key. A replay with the same `(user_id, amount_microcredits,
+  reference_id)` fingerprint returns the original entry; any different
+  fingerprinted field returns `409 idempotency_conflict`. A different key is a
+  new grant even when the reference is unchanged.
+- Reservation `request_id` values are unique per user (migration 0004 replaced
+  the global constraint with `(user_id, request_id)`). A replay keeps the
+  original expiry: `expires_in_seconds` is not fingerprinted. The TTL is capped
+  at 86400 seconds (1 day, `422 invalid_ttl` above it); monthly spend caps use
+  UTC calendar-month boundaries. Money totals that would exceed the BIGINT
+  range are rejected with `422 amount_too_large` before any row is mutated.
 - `credit_ledger` is append-only; the migration installs a trigger that rejects
   `UPDATE` and `DELETE`. `credit_balances` is a materialised projection and is
   rebuildable by replaying the ledger.

@@ -63,7 +63,7 @@ All errors follow the OpenAI-compatible shape, regardless of the route:
 | 405 | `invalid_request_error` | `method_not_allowed` |
 | 409 | `invalid_request_error` | `email_exists` (email already registered) / `idempotency_conflict` (reused idempotency key with different parameters) |
 | 410 | `invalid_request_error` | `reservation_expired` (reservation passed `expires_at`) |
-| 422 | `invalid_request_error` | `invalid_request` (with `param` location) |
+| 422 | `invalid_request_error` | `invalid_request` (with `param` location) / `amount_too_large` / `invalid_ttl` (credit-service bounds) |
 | 429 | `rate_limit_error` | `rate_limit_exceeded` |
 | 502 | `api_error` | `upstream_error` |
 | 5xx | `api_error` | `internal_error` |
@@ -423,11 +423,12 @@ List the authenticated user's ledger entries, newest first. The ledger is **appe
 
 The credit service provides `reserve`, `settle`, `refund`, `release_expired`, and `grant_purchase` operations. They are service-layer operations in Phase 3 (no public HTTP routes yet; `/v1` inference wiring arrives in a later phase) and share these guarantees:
 
-- **Idempotency:** every operation takes an idempotency key. Retries with the same key and parameters return the original outcome; reusing a key with different parameters is a `409 idempotency_conflict`.
+- **Idempotency:** ledger operations use the caller-supplied idempotency key plus a fingerprint (user, amount, reference); reservations use `(user_id, request_id)` uniqueness. Retries with the same key and parameters return the original outcome; reusing a key with different parameters is a `409 idempotency_conflict`. Reservation retries keep the original expiry (TTL is not fingerprinted).
 - **Row locking:** transactions lock rows with `SELECT ... FOR UPDATE` in a fixed order — `users` → `credit_balances` → `credit_reservations` — to avoid deadlocks.
-- **Reservation lifecycle:** `reserve` inserts an `open` reservation (unique per `request_id`, default expiry **15 minutes**) plus a zero-amount `reservation` ledger row; only `reserved` increases. `settle` closes it as `settled`, releases the whole hold, and debits the actual cost (`cost_microcredits ≤ amount_microcredits`) via a negative `settlement` ledger row; the unused difference becomes available again. `refund` and `release_expired` close it as `released`, freeing the hold with a zero-amount `refund` ledger row — `balance` is unchanged. `grant_purchase` credits a positive `purchase` entry to the ledger.
-- **Reserve checks:** insufficient available credits → `402 insufficient_credits`; exceeding `users.spend_cap_monthly_microcredits` for the current UTC calendar month → `402 monthly_spend_cap_exceeded` (0 disables the cap).
-- **Expiry:** settling a reservation past `expires_at` returns `410 reservation_expired`; unknown or foreign reservations return `404 not_found` (existence is not revealed).
+- **Reservation lifecycle:** `reserve` inserts an `open` reservation (unique per `(user_id, request_id)`, default expiry **15 minutes**) plus a zero-amount `reservation` ledger row; only `reserved` increases. `settle` closes it as `settled`, releases the whole hold, and debits the actual cost (`cost_microcredits ≤ amount_microcredits`) via a negative `settlement` ledger row; the unused difference becomes available again. `refund` and `release_expired` close it as `released`, freeing the hold with a zero-amount `refund` ledger row — `balance` is unchanged. `grant_purchase` credits a positive `purchase` entry to the ledger.
+- **Reserve checks:** insufficient available credits → `402 insufficient_credits`; exceeding `users.spend_cap_monthly_microcredits` for the current UTC calendar month → `402 monthly_spend_cap_exceeded` (0 disables the cap). The month window is computed in UTC in application code, so it does not depend on the database session timezone.
+- **Integer bounds:** every resulting `balance`, `reserved`, and lifetime total is validated against the signed `BIGINT` range *before* any mutation (`422 amount_too_large`); reservation TTL is capped at 86400 seconds (`422 invalid_ttl`).
+- **Expiry:** settling a reservation past `expires_at` returns `410 reservation_expired`; unknown or foreign reservations return `404 reservation_not_found` (existence is not revealed).
 
 ## Planned endpoints (later phases)
 
