@@ -143,8 +143,9 @@ export default function DocsPage() {
           <code className="font-mono">GET /v1/models</code> and{" "}
           <code className="font-mono">POST /v1/chat/completions</code>, the
           latter supporting both streaming and non-streaming responses. Billing
-          and usage remain later-phase placeholders: their paths are reserved,
-          but the gateway does not serve them yet.
+          checkout is implemented in Phase 5 through{" "}
+          <code className="font-mono">POST /billing/checkout</code> and the
+          billing dashboard; usage remains a later-phase placeholder.
         </p>
         <ul className="grid gap-3 text-sm text-muted-foreground sm:grid-cols-2">
           <li>
@@ -170,8 +171,9 @@ export default function DocsPage() {
             — owner-only balance and ledger (implemented in Phase 3)
           </li>
           <li>
-            <code className="font-mono">getBillingSummary()</code> — spend
-            snapshot (later-phase placeholder)
+            <code className="font-mono">createCheckout()</code> — Stripe-hosted
+            credit-pack checkout (implemented in Phase 5; credits are granted
+            only after the verified webhook is processed)
           </li>
           <li>
             <code className="font-mono">getUsage()</code> — usage totals

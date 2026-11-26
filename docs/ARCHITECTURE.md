@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-Phase 1 establishes a local, production-shaped topology and security boundaries. Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Phase 3 adds the credit ledger service (reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads. Phase 4 wires the OpenAI-compatible `/v1` inference surface (`GET /v1/models`, `POST /v1/chat/completions` with streaming and non-streaming) through LiteLLM, adding API-key scope enforcement, request size caps, Redis-backed rate limiting, and the reserve/settle/refund lifecycle end-to-end. Service code for health/readiness, configuration, persistence models, security helpers, structured logging, auth, key management, the credit ledger, and inference routing is implemented; Stripe billing flows and observability remain later phases. LiteLLM runs **stateless** (no database, no virtual keys); provider/model selection is still pending product sign-off.
+Phase 1 establishes a local, production-shaped topology and security boundaries. Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Phase 3 adds the credit ledger service (reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads. Phase 4 wires the OpenAI-compatible `/v1` inference surface (`GET /v1/models`, `POST /v1/chat/completions` with streaming and non-streaming) through LiteLLM, adding API-key scope enforcement, request size caps, Redis-backed rate limiting, and the reserve/settle/refund lifecycle end-to-end. Phase 5 adds Stripe Checkout top-ups (`POST /billing/checkout`) and the signature-verified webhook receiver (`POST /webhooks/stripe`); the API records and queues events, and the **worker grants credits** idempotently into the shared ledger. Service code for health/readiness, configuration, persistence models, security helpers, structured logging, auth, key management, the credit ledger, inference routing, and billing ingestion is implemented; receipt email (Phase 6), usage dashboards, and observability remain later phases. LiteLLM runs **stateless** (no database, no virtual keys); provider/model selection is still pending product sign-off.
 
 This document describes the intended architecture and marks which parts are actually implemented.
 
@@ -11,8 +11,8 @@ This document describes the intended architecture and marks which parts are actu
 | Service | Runtime | Ports | Responsibility |
 | --- | --- | --- | --- |
 | `web` | Next.js 15 (standalone) | `127.0.0.1:3000` only | Public pages and dashboard shell. Holds no provider keys and no private datastore credentials. |
-| `api` | FastAPI / Python 3.12 | `127.0.0.1:8000` only | Public OpenAI-compatible gateway (`/v1` implemented in Phase 4), dashboard API and auth (implemented), health/readiness (implemented), usage/billing orchestration (planned). |
-| `worker` | ARQ / Python 3.12 | none | Private async jobs: usage rollup, credit settlement, webhook processing, reconciliation, email (stubs in Phase 1). |
+| `api` | FastAPI / Python 3.12 | `127.0.0.1:8000` only | Public OpenAI-compatible gateway (`/v1` implemented in Phase 4), dashboard API and auth (implemented), health/readiness (implemented), Stripe Checkout + webhook ingestion (Phase 5), usage dashboards (planned). |
+| `worker` | ARQ / Python 3.12 | none | Private async jobs: `process_webhook` credit grants (Phase 5), usage rollup, credit settlement, expiry sweeps, reconciliation, email (Phase 6). Installs the shared API package so it can call `CreditService` directly. |
 | `postgres` | PostgreSQL 16 | none | System of record for users, API keys, credits, usage, payments, webhooks, audit logs, and model pricing. |
 | `redis` | Redis 7 (AOF) | none | Queue backend for ARQ; API-key lookup cache (60s); Phase 4 rate-limit state (sliding window + concurrency counters, fails open on outage). AOF persistence volume is enabled. |
 | `litellm` | LiteLLM proxy (stateless) | none | Only outbound model gateway. Owns provider routing/fallbacks; master key required for proxy auth. Runs **stateless** in Phase 4: no LiteLLM database, no virtual keys, no spend store. FastAPI is authoritative for billing. |
@@ -28,6 +28,7 @@ Internet / client
     v
 Browser -------- dashboard origin --------> FastAPI (/dashboard, /billing)
 Public API client ------------------------> FastAPI (/v1, Bearer API key)
+Stripe (signature-signed webhook) --------> FastAPI (/webhooks/stripe, no JWT)
     |                                           |
     |                                           | private backend network only
     v                                           v
@@ -63,7 +64,50 @@ Rules enforced by configuration:
 8. **Settle and record.** FastAPI records a `usage_events` row (idempotent on `request_id`), settles the reservation (closing it `settled`, debiting actual cost, freeing the unused difference), and returns an OpenAI-compatible response/error. On upstream failure (`502`/`504`) the reservation is refunded/released rather than settled. If a streaming client disconnects, only tokens actually produced are charged and usage status is `partial`.
 9. Background workers roll up usage, release expired reservations (`release_expired`), process webhook events, and send email; worker job bodies and scheduling are later-phase wiring.
 
-As of Phase 4, steps 2–8 are implemented for `/v1` (size caps, validation, auth/scope, rate limiting, reservations, LiteLLM forwarding, settlement/refund, and usage events). LiteLLM remains **stateless**: FastAPI/PostgreSQL is authoritative for auth, billing, spend caps, and usage; there is no LiteLLM database and no virtual keys. Provider/model selection is still **pending product sign-off**, so local dev keeps `model_list: []` and seeds one zero-priced `gateway-default` placeholder row. The implemented API surface is health/readiness, authentication, API-key lifecycle, owner-only dashboard credit reads, and `/v1` (see `docs/API.md`). Stripe billing/webhooks, worker job bodies, usage dashboards, and observability remain later-phase work.
+As of Phase 4, steps 2–8 are implemented for `/v1` (size caps, validation, auth/scope, rate limiting, reservations, LiteLLM forwarding, settlement/refund, and usage events). LiteLLM remains **stateless**: FastAPI/PostgreSQL is authoritative for auth, billing, spend caps, and usage; there is no LiteLLM database and no virtual keys. Provider/model selection is still **pending product sign-off**, so local dev keeps `model_list: []` and seeds one zero-priced `gateway-default` placeholder row. The implemented API surface is health/readiness, authentication, API-key lifecycle, owner-only dashboard credit reads, `/v1`, and (from Phase 5) Stripe Checkout/webhook ingestion (see `docs/API.md`). Usage dashboards and observability remain later-phase work.
+
+## Payment flow (Phase 5)
+
+Stripe is the only external inbound caller, and it calls a public endpoint: there is no JWT on `/webhooks/stripe`. The API verifies the signature and queues; the worker grants. FastAPI **never** writes a credit ledger row for a purchase inline.
+
+```text
+Browser / dashboard
+    |  POST /billing/checkout  (JWT)
+    v
+FastAPI: validate pack + JWT -> create payments row (pending)
+    |  Stripe SDK: Checkout Session with the pack's Price ID
+    v
+Stripe-hosted Checkout page  --user pays--> Stripe
+    |
+    |  POST /webhooks/stripe  (Stripe-Signature, raw body, no JWT)
+    v
+FastAPI: verify HMAC over raw bytes -> insert webhook_events
+         (unique stripe_event_id) -> enqueue process_webhook -> 200 quickly
+    |
+    |  private Redis ARQ queue
+    v
+Worker: process_webhook(event_id)
+    |  grant_purchase(idempotency_key = stripe:<session_id>)
+    v
+credit_ledger (append-only purchase row) + credit_balances
+    +  payments.status = "completed", webhook_events.processed_at set
+```
+
+Flow details:
+
+1. **Checkout:** `POST /billing/checkout` (JWT) validates the `pack_id` against the catalog and creates a `payments` row with `status = pending` before calling Stripe, so the payment can always be reconciled. It calls Stripe Checkout with the pack's configured Price ID, stores `stripe_session_id`, and returns `{checkout_url, session_id, amount_cents, credits, microcredits}`. Blank Stripe settings make the endpoint return `503 stripe_not_configured` (local-only default).
+2. **Webhook:** Stripe calls `POST /webhooks/stripe` with no JWT. FastAPI reads the **raw body**, verifies the `Stripe-Signature` header with `STRIPE_WEBHOOK_SECRET`, and returns `400 invalid_signature` on failure. On success it records the event idempotently in `webhook_events` (unique `stripe_event_id`), commits the row, then enqueues `process_webhook` for `checkout.session.completed` / `checkout.session.async_payment_succeeded` and returns `200 {"status":"queued"}`. A replay of an **unprocessed** event re-enqueues for recovery; a processed replay returns `200 {"status":"already_processed"}` without enqueueing. The 200 is returned quickly — no credit grant happens in the request path.
+3. **Worker grant:** the worker reads the stored event and payment from PostgreSQL and grants only a **paid, USD, catalog-matching** checkout. It validates payment ownership, amount, currency, session, and the exact `metadata.credits` value, then calls `grant_purchase` with `idempotency_key = stripe:<session_id>`. It marks `payments.status = "completed"`, writes `credits_granted`, and sets `webhook_events.processed_at`. Five deliveries still produce exactly one grant because the ledger idempotency key is unique; duplicate recovery jobs are safe.
+4. **Ledger:** the grant is an append-only positive `purchase` row in `credit_ledger`; `credit_balances` is updated materially. The gateway's `/v1` reserve/settle/refund flow then spends those credits as usual. Receipt email is **deferred to Phase 6**.
+
+## Shared API/worker package decision
+
+The worker reuses the API's `CreditService` rather than reimplementing ledger rules: there is exactly one implementation of credit math, idempotency, and row locking. Both packages are installed into the same interpreter.
+
+- The API keeps its `app` module name; the worker package is `worker_app` so the two never collide on import.
+- The Compose `worker` build uses the **repository root** as its context (`dockerfile: apps/worker/Dockerfile`) so the image can `COPY apps/api` and pip-install it before the worker package. Pin sets are a superset in the worker so shared libraries resolve to identical versions.
+- CI installs the API package first (`pip install -e ./apps/api` from the repo root), then the worker with its dev extras (`pip install -e ".[dev]"` from `apps/worker`) before ruff/mypy/pytest.
+- The worker receives `DATABASE_URL` and `REDIS_URL` only. It does **not** receive `STRIPE_SECRET_KEY` or `STRIPE_WEBHOOK_SECRET`: it reads the already-recorded event from the DB and never calls Stripe. `EMAIL_*` is reserved for Phase 6.
 
 ## Data model (Phase 1–3 schema)
 
@@ -75,8 +119,8 @@ The Phase 1/2/3 Alembic revisions (`0001_initial`, `0002_user_password_hash`, `0
 - `credit_balances`: materialised balance/reserved/lifetime counters with non-negative checks, fully rebuildable by replaying `credit_ledger`. `balance` is the total unspent wallet (equals the ledger sum) and includes open holds, so spendable funds are `available = balance - reserved`.
 - `credit_reservations` (Phase 3): outstanding credit holds — `id`, `user_id`, `api_key_id`, `request_id` unique per `(user_id, request_id)`, `status` (`open`/`settled`/`released`), `amount_microcredits` (> 0), `cost_microcredits` (0 ≤ cost ≤ amount), `expires_at` (default 15 minutes), `settled_at`, `released_at`, `created_at`, `updated_at`. Indexed on `(status, expires_at)` for expiry sweeps and `(user_id, created_at)` for history.
 - `usage_events`: per-request user/key/model/token/cost/latency/status with a unique `request_id`.
-- `payments`: provider payment/checkout references and amounts.
-- `webhook_events`: provider event id, payload, status, attempts, and errors.
+- `payments`: provider payment/checkout references and amounts. `amount_cents` is the fiat charge; `credits_granted` holds the microcredits granted; `status` (`pending` → `completed`/`failed`); `stripe_session_id` (unique) links a Checkout session to its grant; `stripe_payment_intent`, `currency`, and `metadata` (e.g. `pack_id`) support reconciliation.
+- `webhook_events`: provider event ingestion log — `stripe_event_id` (unique, the replay guard), `type`, raw `payload` (JSONB; never logged), `processed_at` (terminal-success marker), `error`, and `attempts`. Rows are append-only by convention; do not delete them to retry an event.
 - `audit_logs`: actor/action/resource metadata.
 - `model_pricing`: active input/output prices per 1,000 tokens in microcredits. Local dev seeds one placeholder row `gateway-default` at 0 microcredits per 1k input/output tokens; `GET /v1/models` lists enabled rows.
 
@@ -87,6 +131,7 @@ Database access is async SQLAlchemy 2.x with `asyncpg`. Alembic uses the same `D
 - All runtime configuration comes from environment variables; settings objects have no secret defaults.
 - `.env.example` lists every supported variable name with a blank value. Copy it to `.env` for local work only.
 - Mandatory compose substitutions (`:?`) fail fast if core secrets are unset/blank: database URL, Redis URL, Postgres credentials, Redis password, LiteLLM master key, JWT secret, and API key pepper.
+- Stripe settings (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_10/50/100`, `STRIPE_SUCCESS_URL`, `STRIPE_CANCEL_URL`) are blank by default. Blank `STRIPE_SECRET_KEY` disables billing with `503`; blank `STRIPE_WEBHOOK_SECRET` rejects webhooks with `400 invalid_signature`. Production values come from the secrets manager. The worker receives no Stripe variables.
 - Production values come from the platform secrets manager. No deployed secret is read from a file in the repository.
 - LiteLLM config is mounted read-only. It contains no provider keys, only `os.environ/...` references and routing/timeouts.
 - Terraform and monitoring directories are placeholders; no backend, provider, alert route, or credential is committed.
@@ -146,6 +191,16 @@ Terraform will own networking, managed data services, runtime services, IAM, rem
 - Streaming is proxied as unbuffered SSE; a client disconnect charges only tokens actually produced (`usage_events.status = partial`).
 - LiteLLM `request_timeout` (300s) matches the gateway `HTTP_READ_TIMEOUT` so the gateway owns the client-visible timeout.
 
+## Decisions in Phase 5
+
+- Stripe Checkout is used for credit top-ups. The `api` service is the only service with Stripe keys; the worker reads the recorded event and payment from PostgreSQL and never calls Stripe.
+- The worker **grants credits**, not FastAPI. The webhook request verifies the signature against the raw body, records the event idempotently, enqueues `process_webhook`, and returns `200` fast; the grant is asynchronous.
+- Replay defence is layered: unique `webhook_events.stripe_event_id` stops duplicate jobs, and the ledger's `idempotency_key = stripe:<session_id>` stops duplicate grants even on job retry. Five deliveries → one grant.
+- Money conversion is integer-only: `$1 = 1 credit` and `1 cent = 10,000 microcredits` (e.g. `pack_10` = 1000 cents = 10,000,000 microcredits).
+- The worker builds from the repository root and installs the API package so `CreditService` has one implementation; `app` (API) and `worker_app` (worker) are distinct module names.
+- Local defaults are blank Stripe variables; unconfigured Checkout returns `503` and unconfigured webhooks return `400`. All tests use mocks — no live Stripe calls.
+- Receipt email is deferred to Phase 6.
+
 ## Decisions in Phase 1
 
 - One private network (`backend`) is enough for local topology; do not mark it `internal: true` because LiteLLM needs outbound access to upstream providers.
@@ -157,7 +212,7 @@ Terraform will own networking, managed data services, runtime services, IAM, rem
 
 ## Later-phase TODOs
 
-- Wire Stripe billing (`/billing/*`, `/webhooks/*`), usage dashboards/rollups, and worker job bodies (expiry sweeps, webhook processing, email).
+- Wire usage dashboards/rollups; Stripe billing/webhooks and worker webhook-processing grants are implemented in Phase 5.
 - Select upstream providers/models and public aliases (pending product sign-off), then populate LiteLLM `model_list` and real `model_pricing` rows.
 - Add migrations for any new tables and a backward-compatible migration policy.
 - Add deployment manifests/Terraform, private ingress, TLS, and secret-manager wiring.

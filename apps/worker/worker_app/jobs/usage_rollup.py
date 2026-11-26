@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from app.jobs.common import JobResult
+from worker_app.jobs.common import JobResult
 
 
 async def usage_rollup(

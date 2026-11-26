@@ -63,6 +63,16 @@ class Settings(BaseSettings):
     # Credit reservation hold lifetime before it is eligible for expiry release.
     reservation_ttl_seconds: int = Field(default=900, ge=1, le=86400)
 
+    # Phase 5 / Stripe. All credentials and price ids are env-only and blank by
+    # default so local deployments boot without any Stripe configuration.
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_price_10: str = ""
+    stripe_price_50: str = ""
+    stripe_price_100: str = ""
+    stripe_success_url: str = "http://localhost:3000/dashboard/billing?checkout=success"
+    stripe_cancel_url: str = "http://localhost:3000/dashboard/billing?checkout=cancelled"
+
     @field_validator(
         "database_url", "redis_url", "litellm_master_key", "jwt_secret", "api_key_pepper"
     )
@@ -109,6 +119,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment.lower() in {"production", "prod"}
+
+    @property
+    def stripe_enabled(self) -> bool:
+        """True when a Stripe secret key has been supplied via the environment."""
+        return bool(self.stripe_secret_key.strip())
 
 
 @lru_cache(maxsize=1)

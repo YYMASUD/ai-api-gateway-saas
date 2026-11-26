@@ -153,6 +153,28 @@ export interface CreditLedgerQuery {
   cursor?: string | null;
 }
 
+/** Credit packs currently sold through Stripe Checkout. */
+export type CreditPackId = "pack_10" | "pack_50" | "pack_100";
+
+/** Request body for `POST /billing/checkout`. Redirect URLs are optional. */
+export interface CheckoutRequest {
+  pack_id: CreditPackId;
+  success_url?: string;
+  cancel_url?: string;
+}
+
+/**
+ * Response from `POST /billing/checkout`. Amounts are integers; no credits are
+ * granted here. The verified Stripe webhook enqueues the actual grant.
+ */
+export interface CheckoutResponse {
+  checkout_url: string;
+  session_id: string;
+  amount_cents: number;
+  credits: number;
+  microcredits: number;
+}
+
 interface OpenAIErrorEnvelope {
   error?: unknown;
   detail?: unknown;
@@ -273,6 +295,8 @@ export interface ApiClient {
   getCredits(): Promise<CreditBalance>;
   /** Owner-only ledger page (`GET /dashboard/credits/ledger`), newest first. */
   getCreditLedger(query?: CreditLedgerQuery): Promise<CreditLedgerPage>;
+  /** Start a Stripe Checkout session (`POST /billing/checkout`). */
+  createCheckout(body: CheckoutRequest): Promise<CheckoutResponse>;
   /** Later-phase placeholder: `GET /dashboard/billing` is not implemented yet. */
   getBillingSummary(): Promise<BillingSummary>;
   /** Later-phase placeholder: `GET /dashboard/usage` is not implemented yet. */
@@ -413,6 +437,8 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         `/dashboard/credits/ledger${query ? `?${query}` : ""}`,
       );
     },
+    createCheckout: (body) =>
+      request<CheckoutResponse>("/billing/checkout", { method: "POST", body }),
     // Later-phase placeholders below: paths follow the documented future
     // dashboard contract so this typed surface stays stable when they land.
     getBillingSummary: () => request<BillingSummary>("/dashboard/billing"),

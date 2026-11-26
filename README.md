@@ -2,7 +2,7 @@
 
 Production-grade AI API gateway SaaS with credit billing, API keys, usage metering, and OpenAI-compatible routing.
 
-This repository is in **Phase 4**: the Phase 1 infrastructure/CI foundation, Phase 2 authentication and API keys, Phase 3 credit ledger, and Phase 4 OpenAI-compatible `/v1` inference are implemented. Phase 4 adds `GET /v1/models`, `POST /v1/chat/completions` (streaming and non-streaming), API-key scope enforcement, request size caps, Redis-backed rate limiting, and the reserve/settle/refund lifecycle. **Local defaults are local-only:** LiteLLM is stateless with an empty `model_list` and one zero-priced `gateway-default` placeholder pricing row, so real inference calls return `502 upstream_error` with a full reservation refund until a provider is approved. Billing webhooks and production deployment are still **not implemented**, and the stack does not deploy anywhere yet.
+This repository is in **Phase 5**: the Phase 1 infrastructure/CI foundation, Phase 2 authentication and API keys, Phase 3 credit ledger, Phase 4 OpenAI-compatible `/v1` inference, and Phase 5 Stripe payments are implemented. Phase 5 adds `POST /billing/checkout` (Stripe Checkout top-ups, JWT required) and `POST /webhooks/stripe` (no auth, signature-verified against the raw body). The API verifies, records the event idempotently, and enqueues `process_webhook`; **the worker grants credits** idempotently into the shared ledger — FastAPI never grants inline. The approved ratio is **$1 = 1 credit** (1 cent = 10,000 microcredits). Receipt email is **deferred to Phase 6**. **Local defaults are local-only:** LiteLLM is stateless with an empty `model_list` and one zero-priced `gateway-default` placeholder pricing row, so real inference calls return `502 upstream_error` with a full reservation refund until a provider is approved; blank Stripe variables disable billing (`503` on checkout, `400` on unsigned webhooks). Production deployment is still **not implemented**, and the stack does not deploy anywhere yet.
 
 ## What is here
 
@@ -150,12 +150,14 @@ npm run typecheck
 npm run build
 # npm run e2e   # skipped in CI: browsers are not installed
 
-# Worker
+# Worker (installs the shared API package first, then the worker with dev extras;
+# worker_app imports CreditService from the API `app` package)
 cd apps/worker
+python -m pip install -e ../api
 python -m pip install -e ".[dev]"
 python -m pytest
 ruff check .
-mypy app
+mypy worker_app
 ```
 
 The Phase 2 web UI stores the dashboard JWT in `sessionStorage` so the keys page can call FastAPI directly. This is an interim measure; production must move to HttpOnly cookies behind a BFF (see [docs/SECURITY.md](docs/SECURITY.md)).
@@ -164,7 +166,7 @@ The web build reads `NEXT_PUBLIC_API_BASE_URL` at build time; it must be a publi
 
 `apps/web/.npmrc` pins installs to `https://registry.npmjs.org/`, and CI rejects any `http://` or non-canonical `"resolved"` URL in `package-lock.json` before running `npm ci`.
 
-## Phase 1–4 status
+## Phase 1–5 status
 
 Implemented in Phase 1:
 
@@ -199,15 +201,23 @@ Implemented in Phase 4:
 - Stateless LiteLLM: no database, no virtual keys; FastAPI/PostgreSQL authoritative for auth/billing/spend caps
 - **Local-only defaults:** empty LiteLLM `model_list` and one zero-priced `gateway-default` placeholder; real inference returns `502 upstream_error` (fully refunded) until a provider is approved
 
+Implemented in Phase 5:
+
+- Stripe Checkout top-ups: `POST /billing/checkout` (JWT required) creates a session for `pack_10`/`pack_50`/`pack_100`, returning `201 {checkout_url, session_id, amount_cents, credits, microcredits}`; `503 stripe_not_configured` when Stripe is blank
+- `POST /webhooks/stripe` is unauthenticated but signature-verified against the **raw body**; returns `200 {"status":"queued"}`, `200 {"status":"already_processed"}` on replay, or `400 invalid_signature`; it grants nothing itself
+- The private worker's `process_webhook` grants credits idempotently (`stripe:<session_id>`), marks the payment `completed`, and sets `webhook_events.processed_at`; five deliveries → one grant
+- Stripe secrets and Price IDs are `api`-only; the worker reads the database and has no Stripe keys. All Stripe variables are blank by default; all tests are mocked
+- Credit math: **$1 = 1 credit**, 1 cent = 10,000 microcredits (see the flagged pack-table discrepancy in `docs/API.md`); receipt email deferred to Phase 6
+
 Not yet implemented (later phases):
 
-- Stripe checkout/webhooks, billing dashboard, and usage dashboards/rollups
 - Real upstream providers/models and public aliases (pending product sign-off); local dev uses only the zero-priced `gateway-default` placeholder and an empty LiteLLM `model_list`, so real inference returns `502 upstream_error` with a full reservation refund
+- Billing dashboard and usage dashboards/rollups
 - Production deployment, TLS/ingress, managed databases, secret-manager wiring, and monitoring stacks
 - Durable audit export, on-call alert routing, and SLOs
 - Migration from interim `sessionStorage` JWTs to HttpOnly cookie / BFF-based session handling
 - Password reset and account recovery flows
-- Worker job bodies and scheduling for usage rollups, expiry sweeps, webhooks, and email
+- Receipt email (Phase 6) and remaining worker job bodies/scheduling for usage rollups and expiry sweeps (webhook credit grants are implemented)
 
 See [docs/API.md](docs/API.md) for the implemented vs. planned API surface and [docs/SECURITY.md](docs/SECURITY.md) for the auth/key threat model.
 
@@ -227,7 +237,7 @@ Open questions:
 
 - Which upstream model providers and public model aliases are approved for the first paid launch? (LiteLLM stays stateless either way; provider/model selection is pending product sign-off.)
 - Decided: LiteLLM is stateless — no LiteLLM database/virtual keys; FastAPI is authoritative for billing.
-- Pricing/credit-pack catalog and Stripe product/price model are not fixed.
+- Pricing/credit-pack catalog and Stripe Price IDs are fixed for Phase 5 (`pack_10/50/100`; see the flagged microcredit discrepancy in `docs/API.md`); public pricing and launch currency still need product sign-off
 - Email provider choice and deliverability/domain setup are not fixed.
 - Observability backend, retention, alert routing, and on-call ownership are not fixed.
 - Public rate-limit tiers, quota policy, and abuse controls need product sign-off.

@@ -8,8 +8,9 @@ This document describes the current security posture and the controls required b
 - **Phase 2** adds self-built email/password authentication (Argon2id) and API-key lifecycle management in FastAPI.
 - **Phase 3** adds the credit ledger service (row-locked, idempotent reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads.
 - **Phase 4** wires the OpenAI-compatible `/v1` inference surface through stateless LiteLLM, adding API-key scope enforcement, request size caps, Redis-backed rate limiting (deliberately fail-open on Redis outage), and the reserve/settle/refund lifecycle end-to-end.
+- **Phase 5** adds Stripe Checkout top-ups and the Stripe webhook receiver: raw-body signature verification, replay/idempotency defence in depth, and worker-executed credit grants where FastAPI never grants inline.
 
-Stripe billing/webhooks, usage dashboards, and production monitoring remain later-phase work. The dashboard's interim client-side token handling (see [Interim dashboard token handling](#interim-dashboard-token-handling-sessionstorage)) is **not** production-acceptable and must be migrated.
+Stripe billing is now **implemented (Phase 5)**; receipt email (Phase 6), usage dashboards, and production monitoring remain later-phase work. The dashboard's interim client-side token handling (see [Interim dashboard token handling](#interim-dashboard-token-handling-sessionstorage)) is **not** production-acceptable and must be migrated.
 
 ## Assets and threat model
 
@@ -32,7 +33,7 @@ Primary threats:
 | API key theft/leak | `sk_live_` + 32 random bytes; SHA-256+pepper hash (raw never stored); 8-char prefix only; deterministic peppered-hash lookup (constant-time compare helper available); revoke invalidates Redis cache | Rate limits, per-key spend caps, rotation automation |
 | JWT forgery/replay | HS256 pinned in code and config; required `exp`, `iss`, `aud`; short TTL via `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Token revocation list, signing-key rotation, move browser tokens to HttpOnly cookies |
 | Dashboard token exposure (XSS) | Interim `sessionStorage` storage — **accepted risk for Phase 2 only** | Migrate to HttpOnly cookies behind a BFF |
-| Stripe webhook forgery | Env-only webhook secret placeholder | Verify signatures; idempotent event processing; replay protection |
+| Stripe webhook forgery | Unauthenticated endpoint is signature-gated: HMAC verified over the **exact raw body** with `STRIPE_WEBHOOK_SECRET`; `400 invalid_signature` otherwise. Unique `stripe_event_id` + ledger `stripe:<session_id>` idempotency key stop replay/double grants; worker grants asynchronously. | Production replay-window/timestamp policy and rotation runbook; monitor failed events |
 | Sensitive log leakage | Structlog processor drops sensitive keys and masks known token formats; no key/hash/token logging | Add log-access controls and retention policy |
 | Dependency vulnerabilities | pip-audit and npm audit in CI | Automated patching/SBOM and signed images |
 | Request tracing gaps | Request ID on response and log context | Centralized log search and alerting |
@@ -47,6 +48,8 @@ Rules:
 4. **LiteLLM master key is shared only with FastAPI** (and the LiteLLM container) for management/proxy auth. Next.js and the browser never receive it.
 5. **Mandatory secrets have no defaults.** `DATABASE_URL`, `REDIS_URL`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `LITELLM_MASTER_KEY`, `JWT_SECRET`, and `API_KEY_PEPPER` must be non-empty or compose/config fails.
 6. **Do not print secrets.** CI never echoes secret values. Application logging redacts fields such as `authorization`, `password`, `database_url`, `redis_url`, `litellm_master_key`, `api_key_pepper`, prompts, completions, and message bodies.
+7. **Stripe secrets are `api`-only.** `STRIPE_SECRET_KEY` (secret API key) and `STRIPE_WEBHOOK_SECRET` (endpoint signing secret) are read only by the `api` service. They are never given to `web` (browser or server) or to `worker` (the worker reads the recorded event from PostgreSQL and never calls Stripe). They are never placed in `NEXT_PUBLIC_*`, logs, error bodies, or audit rows.
+8. **Local defaults disable billing.** `.env.example` ships every Stripe variable blank. A blank `STRIPE_SECRET_KEY` makes `POST /billing/checkout` return `503 stripe_not_configured`, and a blank `STRIPE_WEBHOOK_SECRET` makes `POST /webhooks/stripe` return `400 invalid_signature`. The stack therefore runs without any Stripe secret present; there are no invented/default keys. Test-mode keys (`sk_test_...`, `whsec_...`) are used locally only and never committed.
 
 Local generation examples (values are generated in your shell; do not paste them into files):
 
@@ -111,6 +114,48 @@ The credit service (`reserve`, `settle`, `refund`, `release_expired`, `grant_pur
 
 Reconciliation (comparing ledger sums to materialised balances) is **read-only**. Rebuilding `credit_balances` by replaying the ledger is **admin-only tooling in a later phase**; until then, never hand-edit balances or ledger rows — use compensating operations and follow `docs/RUNBOOK.md`.
 
+## Stripe webhook security (Phase 5)
+
+### Raw-body signature verification
+
+`POST /webhooks/stripe` is **unauthenticated** (Stripe cannot present a JWT) but **signature-gated**:
+
+- FastAPI reads the **raw request bytes** directly from the request, before any JSON parsing or framework re-serialization, and verifies the `Stripe-Signature` header against `STRIPE_WEBHOOK_SECRET` over those exact bytes.
+- Any missing/invalid signature, or a blank webhook secret, returns `400 invalid_signature`; no `webhook_events` row is written and no job is enqueued.
+- Because verification uses the byte-for-byte body, callers must not re-serialize the payload (no pretty-printing, key reordering, or extra whitespace). Proxies must pass the body through unmodified.
+- Do not substitute an "empty-body pass-through" or a hand-rolled comparison; use the Stripe SDK constructor with the raw payload and header.
+
+### Replay and idempotency defence in depth
+
+Three independent layers prevent a replayed or duplicated event from granting credits twice:
+
+1. **Unique `webhook_events.stripe_event_id`.** Recording is insert-if-new; an existing event returns `200 {"status":"already_processed"}` and **does not** enqueue a second job.
+2. **Unique ledger idempotency key `stripe:<session_id>`.** The worker's `grant_purchase` is idempotent on this key, so even a duplicated/retried job cannot add a second `credit_ledger` purchase row or change `credit_balances` twice.
+3. **Terminal `webhook_events.processed_at`.** Once set, the event is done; replays are no-ops.
+
+Net guarantee: **five deliveries of the same event produce exactly one grant.** Never delete `webhook_events` rows or ledger idempotency keys to force a retry (see [docs/RUNBOOK.md](RUNBOOK.md)).
+
+### FastAPI never grants credits inline
+
+The webhook handler only verifies, records, and enqueues; it does not touch the credit ledger. The grant executes in the private worker, which shares the API's `CreditService` so there is a single, row-locked, idempotent implementation. This keeps the HTTP path fast (Stripe gets a prompt 200) and isolates ledger writes from the public request path.
+
+### Payloads, card data, and emails are never logged
+
+- The webhook `payload` JSONB and the Checkout response may contain customer data; they are stored in PostgreSQL for the worker but are **never logged**. Only the opaque Stripe event ID and event type are logged.
+- **Card data never reaches the gateway.** Payment card entry happens entirely on Stripe-hosted Checkout; the API stores only a session ID, payment-intent ID, amount, and status — never a PAN, CVC, or expiry.
+- **Email addresses are not logged.** Receipt email is deferred to Phase 6; when added it must read the address from Stripe/DB rather than logging it.
+- Checkout-creation failures log only the exception **type** and the opaque `payment_id`; Stripe error text (which can echo request details) is not logged.
+
+### Secret handling for Stripe
+
+- `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are mandatory only when billing is enabled; blank is the safe local default and disables billing (`503`/`400`) rather than falling back to any embedded key.
+- Use **test-mode** keys locally. Production keys come from the secrets manager. Rotate immediately if either may have leaked, and re-point the Stripe endpoint at the new signing secret.
+- Use a **distinct** endpoint signing secret per environment; never reuse the dashboard/test endpoint secret in production.
+
+### 503-when-unconfigured behaviour
+
+Billing fails **closed and obvious** when unconfigured: Checkout returns `503 stripe_not_configured` (no payment row is left `pending`), and the webhook rejects unsigned traffic with `400`. This is intentional — an unconfigured environment does not silently accept payments or grant credits.
+
 ## Interim dashboard token handling (sessionStorage)
 
 The Phase 2 dashboard stores the Bearer JWT in **`sessionStorage`** (`apps/web/lib/auth-token.ts`) so client components can call `/auth/*` and `/dashboard/*` directly.
@@ -131,13 +176,13 @@ Required production migration:
 ## Network and container boundaries
 
 - `web` and `api` publish `127.0.0.1:3000` and `127.0.0.1:8000` respectively in local Compose. Publishing only on loopback avoids accidental LAN exposure.
-- `postgres`, `redis`, `litellm`, and `worker` publish no host ports. They are reachable only from services on the `backend` Docker network.
+- `postgres`, `redis`, `litellm`, and `worker` publish no host ports. They are reachable only from services on the `backend` Docker network. The worker is built from the repository root (to install the shared API package) but still runs with no published port.
 - LiteLLM needs outbound internet access to providers; the local `backend` network is therefore not marked `internal`. In production, restrict egress with a firewall/proxy allowlist.
 - The API Dockerfile runs as an unprivileged user and defines its own `/healthz` container healthcheck; the worker Dockerfile also runs unprivileged.
 - Redis requires a password even on the private network. AOF persistence is enabled. Phase 4 rate-limit state lives in Redis; its unavailability makes rate limiting fail open rather than blocking inference.
 - Postgres is initialized with data checksums.
 
-## Application controls implemented (Phases 1–4)
+## Application controls implemented (Phases 1–5)
 
 - Pydantic settings read environment variables only; secret fields reject blank values.
 - Passwords are hashed with Argon2id; login returns generic invalid-credential `401` responses.
@@ -151,6 +196,7 @@ Required production migration:
 - `/v1` enforces per-endpoint API-key scopes (`insufficient_scope`), a request body size cap (`request_too_large`), and Redis-backed per-key rate limits with `Retry-After`; rate limiting fails open on Redis outage by design while PostgreSQL credit controls remain authoritative.
 - `/v1` never stores or logs prompt/completion content; `usage_events` records only token counts, cost, latency, and status.
 - The reserve is fully refunded on `502 upstream_error` / `504 upstream_timeout`, so failed inference consumes no credits.
+- Stripe webhooks are verified over the raw body (`invalid_signature` on failure), recorded idempotently by unique `stripe_event_id`, and granted by the worker with ledger idempotency key `stripe:<session_id>`; FastAPI never grants inline. Blank Stripe settings return `503` (checkout) / `400` (webhook). Stripe keys and payloads/card data/emails are never logged.
 - Security headers are set for all web routes: CSP, HSTS (non-production `max-age=0`), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, Permissions-Policy.
 - LiteLLM config enables retries/timeouts and contains no keys; master key is read from `os.environ`.
 - CI uses least-privilege `contents: read`, pinned action SHAs, `persist-credentials: false`, gitleaks, pip-audit, npm audit, and compose validation.
@@ -160,7 +206,7 @@ Required production migration:
 1. Validate and product-sign-off on upstream providers/models; keep `/v1` rate limits, size caps, and scope enforcement tuned for launch traffic (they are implemented in Phase 4 but need production tuning).
 2. Migrate the dashboard from interim `sessionStorage` JWTs to HttpOnly cookies behind a BFF, and add CSRF protections.
 3. Add password reset/recovery and email verification; add login rate limiting/lockout and breached-password checks.
-4. Verify Stripe webhook signatures and make all event handling idempotent.
+4. Verify Stripe webhook signatures and make all event handling idempotent. (Implemented in Phase 5; before production, define the replay-window/timestamp policy, distinct per-environment endpoint secrets, and alerting on failed events.)
 5. Add account-level authorization checks and expand audit-log coverage for sensitive actions.
 6. Run services behind TLS/private ingress; keep data services private with TLS and managed backups.
 7. Add secret-manager injection and rotation runbooks (including JWT signing-key rotation and API-key pepper rotation); rotate any value that may have been exposed.

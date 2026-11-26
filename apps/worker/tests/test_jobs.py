@@ -2,9 +2,8 @@
 
 import pytest
 
-from app.jobs import (
+from worker_app.jobs import (
     expire_reservations,
-    process_webhook,
     reconciliation,
     send_email,
     settle_credits,
@@ -16,12 +15,6 @@ from app.jobs import (
 async def test_settle_credits_is_noop() -> None:
     result = await settle_credits({}, usage_event_id="usage-1")
     assert result == {"status": "noop", "job": "settle_credits"}
-
-
-@pytest.mark.asyncio
-async def test_process_webhook_is_noop() -> None:
-    result = await process_webhook({}, event_id="event-1")
-    assert result == {"status": "noop", "job": "process_webhook"}
 
 
 @pytest.mark.asyncio

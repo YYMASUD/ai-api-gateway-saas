@@ -343,6 +343,134 @@ describe("createApiClient", () => {
     expect(fetchImpl.mock.calls[0][1]?.method).toBe("DELETE");
   });
 
+  it("POSTs checkout payloads to /billing/checkout with a bearer token", async () => {
+    const checkout = {
+      checkout_url: "https://checkout.stripe.test/c/pay/cs_test_123",
+      session_id: "cs_test_123",
+      amount_cents: 5_000,
+      credits: 50,
+      microcredits: 50_000_000,
+    };
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) => jsonResponse(checkout),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    await expect(
+      client.createCheckout({ pack_id: "pack_50" }),
+    ).resolves.toEqual(checkout);
+
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://localhost:8000/billing/checkout");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBe(JSON.stringify({ pack_id: "pack_50" }));
+    expect(init?.headers).toMatchObject({
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${FAKE_TOKEN}`,
+    });
+  });
+
+  it("passes optional checkout redirect URLs through unchanged", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse({
+          checkout_url: "https://checkout.stripe.test/c/pay/cs_test_123",
+          session_id: "cs_test_123",
+          amount_cents: 1_000,
+          credits: 10,
+          microcredits: 10_000_000,
+        }),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    await client.createCheckout({
+      pack_id: "pack_10",
+      success_url: "http://localhost:3000/dashboard/billing?checkout=success",
+      cancel_url: "http://localhost:3000/dashboard/billing?checkout=cancelled",
+    });
+
+    expect(fetchImpl.mock.calls[0][1]?.body).toBe(
+      JSON.stringify({
+        pack_id: "pack_10",
+        success_url: "http://localhost:3000/dashboard/billing?checkout=success",
+        cancel_url:
+          "http://localhost:3000/dashboard/billing?checkout=cancelled",
+      }),
+    );
+  });
+
+  it("parses the stripe_not_configured 503 envelope", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse(
+          {
+            error: {
+              message: "Stripe is not configured",
+              type: "service_unavailable",
+              param: null,
+              code: "stripe_not_configured",
+            },
+          },
+          { status: 503 },
+        ),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    expect.assertions(4);
+    try {
+      await client.createCheckout({ pack_id: "pack_10" });
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(ApiError);
+      const error = cause as ApiError;
+      expect(error.status).toBe(503);
+      expect(error.code).toBe("stripe_not_configured");
+      expect(error.message).toBe("Stripe is not configured");
+    }
+  });
+
+  it("parses the upstream_error 502 envelope", async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        jsonResponse(
+          {
+            error: {
+              message: "Could not create Stripe checkout session",
+              type: "upstream_error",
+              param: null,
+              code: "upstream_error",
+            },
+          },
+          { status: 502 },
+        ),
+    );
+    const client = createApiClient({
+      baseUrl: "http://localhost:8000",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      token: FAKE_TOKEN,
+    });
+
+    await expect(
+      client.createCheckout({ pack_id: "pack_100" }),
+    ).rejects.toMatchObject({
+      name: "ApiError",
+      status: 502,
+      code: "upstream_error",
+      message: "Could not create Stripe checkout session",
+    });
+  });
+
   it("parses OpenAI error envelopes with code and type", async () => {
     const fetchImpl = vi.fn(
       async (_url: string, _init?: RequestInit) =>

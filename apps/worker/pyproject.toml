@@ -7,16 +7,39 @@ name = "ai-api-gateway-worker"
 version = "0.1.0"
 description = "Private background worker skeleton for the AI API gateway."
 requires-python = "==3.12.*"
+# These pins are a SUPERSET of the API runtime dependencies in ../api/pyproject.toml
+# so both packages resolve to a single, identical set of shared libraries when
+# installed into the same interpreter/image. Bumping a shared pin here (pydantic,
+# redis, structlog, SQLAlchemy, asyncpg, httpx, PyJWT, ...) must match the API.
+# The API package is NOT declared by name: it is installed separately in the
+# image and by developers (see the install note below).
 dependencies = [
   "arq==0.28.0",
   "httpx==0.28.1",
-  "pydantic==2.14.4",
-  "pydantic-settings==2.16.3",
+  "pydantic==2.10.4",
+  "pydantic-settings==2.7.1",
   # redis-py is published under the "redis" distribution name.
-  "redis==5.3.1",
-  "structlog==26.1.0",
+  "redis==5.2.1",
+  "structlog==24.4.0",
+  "SQLAlchemy[asyncio]==2.0.36",
+  "asyncpg==0.30.0",
+  "PyJWT==2.15.1",
+  "argon2-cffi==25.1.0",
+  "email-validator==2.4.0",
 ]
 
+# The API is an optional local path dependency used for development against the
+# shared ledger services (e.g. ``from app.services.credit_service import
+# CreditService``). Install both packages into one environment from apps/worker:
+#
+#   python -m venv /tmp/worker-venv
+#   /tmp/worker-venv/bin/pip install -e ../api      # provides the ``app`` package
+#   /tmp/worker-venv/bin/pip install -e '.[dev]'     # provides ``worker_app``
+#   /tmp/worker-venv/bin/python -c "from app.services.credit_service import CreditService; from worker_app.settings import WorkerSettings; print('both importable')"
+#
+# The API is deliberately not a named pip requirement here: it is a local path
+# dependency installed from ../api in development and from /opt/api-src in the
+# image. The Dockerfile installs the API before this package instead.
 [project.optional-dependencies]
 dev = [
   "mypy==2.4.1",
@@ -27,7 +50,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["worker_app*"]
 exclude = ["tests*"]
 
 [tool.pytest.ini_options]
@@ -46,12 +69,15 @@ src = ["."]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["worker_app"]
+
 [tool.ruff.format]
 quote-style = "double"
 
 [tool.mypy]
 python_version = "3.12"
-files = ["app", "tests"]
+files = ["worker_app", "tests"]
 strict = true
 show_error_codes = true
 pretty = true

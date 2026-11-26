@@ -8,7 +8,8 @@ This document describes the FastAPI gateway's HTTP surface.
 - **Phase 2** implements self-built email/password authentication (`/auth/*`) and API-key lifecycle management (`/dashboard/keys*`); `/auth/me` and `/dashboard/keys*` are protected by HS256 JWTs, while `/auth/register` and `/auth/login` are public.
 - **Phase 3** implements owner-only credit reads (`/dashboard/credits*`) and the internal credit ledger/reservation service (reserve, settle, refund, release_expired, grant_purchase); dashboard reads are protected by HS256 JWTs.
 - **Phase 4** implements the OpenAI-compatible `/v1/*` surface (GET `/v1/models`, POST `/v1/chat/completions` with streaming and non-streaming), API-key scope enforcement, request size caps, Redis-backed rate limiting, and the reserve/settle/refund lifecycle wired through LiteLLM.
-- **Later phases** add billing/webhooks (`/billing/*`, `/webhooks/*`), usage dashboards, and admin tooling. These are documented as *planned* and are not implemented yet.
+- **Phase 5** implements Stripe Checkout top-ups (`POST /billing/checkout`) and the Stripe webhook receiver (`POST /webhooks/stripe`); the **worker** grants credits idempotently after the API verifies the signature, records the event, and enqueues `process_webhook`. FastAPI never grants credits inline.
+- **Later phases** add usage dashboards, admin tooling, and receipt email (deferred from Phase 5). Anything not in the "Implemented endpoints" sections below is *planned* and not registered yet.
 
 ## Base URLs
 
@@ -36,7 +37,9 @@ Every response includes an `X-Request-ID` header. If the request carried a sanit
 | `/dashboard/credits`, `/dashboard/credits/ledger` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 3 (implemented) |
 | `/v1/models` | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`); scope `models:read` | 4 (implemented) |
 | `/v1/chat/completions` | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`); scope `chat:completions` | 4 (implemented) |
-| `/billing/*`, `/webhooks/*`, `/admin/*` | API key or JWT as appropriate; webhook signature verification | later (planned) |
+| `/billing/checkout` | `Authorization: Bearer <jwt>` (HS256) | 5 (implemented) |
+| `/webhooks/stripe` | none (public); gated by Stripe signature over the raw body | 5 (implemented) |
+| `/dashboard/usage`, `/dashboard/billing`, `/admin/*` | API key or JWT as appropriate | later (planned) |
 
 Phase 2 implements email/password authentication and JWT issuance. The cryptographic helpers (`apps/api/app/core/security.py`) are wired as FastAPI dependencies for `/dashboard/*` routes. Phase 4 wires the same API-key auth dependency into `/v1/*` and adds per-scope enforcement.
 
@@ -68,7 +71,9 @@ All errors follow the OpenAI-compatible shape, regardless of the route:
 | 413 | `invalid_request_error` | `request_too_large` (request body exceeds `MAX_REQUEST_BYTES`) |
 | 422 | `invalid_request_error` | `invalid_request` (with `param` location) / `amount_too_large` / `invalid_ttl` (credit-service bounds) / `max_tokens_exceeded` (requested `max_tokens` exceeds `MAX_OUTPUT_TOKENS`) |
 | 429 | `rate_limit_error` | `rate_limit_exceeded` (per-key sliding-window or concurrent-cap breach; response includes `Retry-After` header in seconds) |
-| 502 | `api_error` | `upstream_error` (LiteLLM returned a non-timeout failure, or no routable model is configured) |
+| 400 | `invalid_request_error` | `invalid_signature` (Stripe webhook signature missing/invalid, or webhook secret unconfigured; in addition to the general 400 cases) |
+| 502 | `api_error` | `upstream_error` (LiteLLM returned a non-timeout failure, no routable model, or Stripe Checkout creation failed) |
+| 503 | `api_error` | `stripe_not_configured` (`STRIPE_SECRET_KEY` blank; billing disabled locally) |
 | 504 | `api_error` | `upstream_timeout` (LiteLLM or the upstream provider did not respond within the read timeout) |
 | 5xx | `api_error` | `internal_error` |
 
@@ -573,6 +578,130 @@ Local dev seeds **one placeholder pricing row** `gateway-default` at **0 microcr
 - `POST /v1/chat/completions` passes auth, size, validation, rate-limit, and reservation (the 1-microcredit floor), then LiteLLM has no routable model and returns an error. The gateway maps this to **`502 upstream_error`** and **fully refunds** the reservation. Credits are not consumed.
 - This 502 is **expected** in local dev and confirms the reserve/refund lifecycle works end-to-end before a real provider is configured.
 
+## Implemented endpoints (Phase 5)
+
+Phase 5 adds Stripe Checkout credit top-ups and the Stripe webhook receiver. **FastAPI never grants credits inline.** It verifies the webhook signature against the raw body, records the event idempotently, and enqueues `process_webhook`; the worker grants the credits idempotently, marks the payment `completed`, and sets `webhook_events.processed_at`. Receipt email is **deferred to Phase 6**.
+
+### Credit packs and integer math
+
+The approved conversion rule is **$1 = 1 credit** and **1 cent = 10,000 microcredits** (`1 credit = 1,000,000 microcredits`). All amounts are integers; no floats or rounding are used.
+
+Approved Phase 5 pack catalog (values as specified by the Phase 5 decision):
+
+| `pack_id` | `amount_cents` | `credits` | `microcredits` |
+| --- | --- | --- | --- |
+| `pack_10` | 1000 | 10 | 10,000,000 |
+| `pack_50` | 5000 | 50 | 50,000,000 |
+| `pack_100` | 10000 | 100 | 100,000,000 |
+
+All values are derived with pure integer arithmetic: `microcredits = amount_cents × 10,000`.
+
+### `POST /billing/checkout`
+
+Create a Stripe Checkout session for a credit pack. JWT required; owner-only (the JWT `sub` identifies the buyer).
+
+**Headers:** `Authorization: Bearer <jwt>`; `Content-Type: application/json`.
+
+**Request:**
+
+```json
+{
+  "pack_id": "pack_10",
+  "success_url": "https://dashboard.example.com/dashboard/billing?checkout=success",
+  "cancel_url": "https://dashboard.example.com/dashboard/billing?checkout=cancelled"
+}
+```
+
+`pack_id` is required and must be one of `pack_10`, `pack_50`, `pack_100`. `success_url` and `cancel_url` are optional; omitted values fall back to `STRIPE_SUCCESS_URL` / `STRIPE_CANCEL_URL` (local defaults point at `http://localhost:3000/dashboard/billing`). Redirect URLs must be HTTPS, or plain HTTP on a local host (`localhost`, `127.0.0.1`, `::1`).
+
+**Response (201):**
+
+```json
+{
+  "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_...",
+  "session_id": "cs_test_...",
+  "amount_cents": 1000,
+  "credits": 10,
+  "microcredits": 100000
+}
+```
+
+The response contains the hosted Checkout URL and the integer amounts for the selected pack. It does **not** grant credits; the grant happens only after a verified webhook is processed by the worker.
+
+**Status codes and errors:**
+
+| Status | `code` / shape | Meaning |
+| --- | --- | --- |
+| 201 | success envelope above | Checkout session created; redirect the browser to `checkout_url` |
+| 401 | `authentication_error` / `invalid_token` | No JWT, or missing/invalid/expired JWT |
+| 422 | `invalid_request_error` / `invalid_request` | Unknown `pack_id` (schema validation), malformed body, or a redirect URL that is neither HTTPS nor a local HTTP URL |
+| 503 | `api_error` / `stripe_not_configured` | Stripe is not configured: `STRIPE_SECRET_KEY` is blank; billing is disabled locally |
+| 502 | `api_error` / `upstream_error` | Stripe API failure while creating the session (implemented behavior beyond the base contract) |
+
+### `POST /webhooks/stripe`
+
+Public webhook receiver — **no authentication**. Requests are gated by Stripe signature verification against the **raw request body** using `STRIPE_WEBHOOK_SECRET` and the `Stripe-Signature` header. This endpoint grants nothing itself.
+
+**Headers:** `Stripe-Signature: <stripe signature header>`; `Content-Type: application/json`. No `Authorization` header is sent or required.
+
+**Request:** the exact JSON body delivered by Stripe. Do not re-serialize or pretty-print it before sending; verification uses the byte-for-byte payload.
+
+```json
+{
+  "id": "evt_...",
+  "object": "event",
+  "type": "checkout.session.completed",
+  "data": { "object": { "id": "cs_test_..." } }
+}
+```
+
+**Response (200, first delivery):**
+
+```json
+{ "status": "queued" }
+```
+
+**Response (200, replay of an already-recorded event):**
+
+```json
+{ "status": "already_processed" }
+```
+
+**Response (400, bad signature):**
+
+```json
+{
+  "error": {
+    "message": "Invalid webhook signature",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "invalid_signature"
+  }
+}
+```
+
+**Status codes and errors:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 `{"status":"queued"}` | Signature valid, event recorded, `process_webhook` enqueued. An **unprocessed** replay also returns `queued` and re-enqueues for recovery. |
+| 200 `{"status":"already_processed"}` | Signature valid, the event is already recorded **and processed**; no duplicate job enqueued |
+| 400 `invalid_signature` | Signature missing/invalid, or the webhook secret is not configured; no event recorded, no job enqueued |
+| 200 `{"status":"ignored"}` | Valid event of a type other than `checkout.session.completed` / `checkout.session.async_payment_succeeded`: recorded but not enqueued |
+
+Payloads and customer data are never written to logs — only the opaque event ID and event type.
+
+### Worker credit grant and replay guarantee
+
+`process_webhook(event_id)` is executed by the private ARQ worker, which shares the API's credit package. It handles `checkout.session.completed` and `checkout.session.async_payment_succeeded` only when `payment_status == "paid"`, the currency is USD, and `amount_total` matches a catalog pack. For a valid paid event it:
+
+1. Resolves the stored event and payment, verifies the payment belongs to the same user and has the same amount/session, and uses `idempotency_key = stripe:<session_id>` for the ledger grant.
+2. Calls the credit service's `grant_purchase` to add the pack's microcredits to the append-only `credit_ledger` (and materialised `credit_balances`) exactly once.
+3. Marks the `payments` row `completed` and sets `webhook_events.processed_at`.
+4. Leaves unpaid / non-USD / non-catalog events unprocessed and retryable with a short `webhook_events.error`; a replayed unprocessed event can therefore be re-enqueued safely.
+
+**Replay guarantee:** delivering the same paid webhook **five times** results in **one** credit grant. While the event is unprocessed, deliveries may each re-enqueue a recovery job (safe); once `processed_at` is set, deliveries return `already_processed` without a new job. The ledger idempotency key `stripe:<session_id>` makes any duplicate worker run a no-op. Never delete `webhook_events` rows or ledger idempotency keys to "force" a retry — see [docs/RUNBOOK.md](RUNBOOK.md).
+
 ## Planned endpoints (later phases)
 
 These remaining routes are not registered yet and currently return `404 not_found`; their routers exist as empty placeholders. They are listed here so clients can be shaped against a stable contract. The `/v1/*` routes documented above are implemented in Phase 4 and are not listed here.
@@ -584,14 +713,11 @@ These remaining routes are not registered yet and currently return `404 not_foun
 | `GET` | `/dashboard/usage` | later | Per-key, per-day, per-model aggregates |
 | `GET` | `/dashboard/billing` | later | Plan and upcoming invoice; the credit balance itself is already served by `GET /dashboard/credits` (Phase 3) |
 
-> **Note:** Authentication (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`) and API-key lifecycle (`GET/POST/DELETE /dashboard/keys*`) are implemented in Phase 2. The credit ledger and owner-only dashboard credit reads (`GET /dashboard/credits`, `GET /dashboard/credits/ledger`) are implemented in Phase 3. The OpenAI-compatible `/v1/models` and `/v1/chat/completions` routes are implemented in Phase 4. See the "Implemented endpoints" sections above.
+> **Note:** Authentication (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`) and API-key lifecycle (`GET/POST/DELETE /dashboard/keys*`) are implemented in Phase 2. The credit ledger and owner-only dashboard credit reads (`GET /dashboard/credits`, `GET /dashboard/credits/ledger`) are implemented in Phase 3. The OpenAI-compatible `/v1/models` and `/v1/chat/completions` routes are implemented in Phase 4. Stripe Checkout and the Stripe webhook receiver are implemented in Phase 5. See the "Implemented endpoints" sections above.
 
 ### Billing and webhooks
 
-| Method | Path | Phase | Notes |
-| --- | --- | --- | --- |
-| `POST` | `/billing/checkout` | later | Creates a Stripe Checkout session |
-| `POST` | `/webhooks/stripe` | later | Verifies signature, idempotent event processing |
+`POST /billing/checkout` and `POST /webhooks/stripe` are **implemented in Phase 5** (see [Implemented endpoints (Phase 5)](#implemented-endpoints-phase-5)). Receipt email and any provider beyond Stripe remain later phases.
 
 ### Admin
 
@@ -604,7 +730,7 @@ These remaining routes are not registered yet and currently return `404 not_foun
 | Header | Direction | Description |
 | --- | --- | --- |
 | `X-Request-ID` | both | Request correlation ID (sanitized; max 128 chars). |
-| `Authorization` | request | `Bearer <jwt>` for `/auth/me` and `/dashboard/*`; `Bearer <api_key>` for `/v1` (Phase 4). |
+| `Authorization` | request | `Bearer <jwt>` for `/auth/me`, `/dashboard/*`, and `/billing/checkout`; `Bearer <api_key>` for `/v1` (Phase 4). `/webhooks/stripe` uses no `Authorization` (signature-gated). |
 | `Content-Type` | both | `application/json` for JSON bodies. |
 | `Accept` | request | `application/json` expected. |
 
@@ -619,7 +745,7 @@ Because the browser currently sends the JWT as a Bearer header (see the interim 
 - The `/v1` surface is intended to be OpenAI-compatible for request/response shapes and error codes. Streaming (`stream: true`) is supported as of Phase 4; advanced features (function calling, responses API) are later phases.
 - Money is represented as integer **microcredits** (`1,000,000 microcredits = 1 credit`). No floating-point currency values are stored or returned.
 - As of Phase 4, `POST /v1/chat/completions` enforces the request size cap, validation, per-key rate limiting, and the credit reserve/settle/refund lifecycle; `GET /v1/models` lists enabled models. The Phase 3 credit service remains authoritative for balance, reservations, and the monthly cap.
-- Auth and API-key management are implemented in Phase 2; the credit ledger and dashboard credit reads are implemented in Phase 3; the OpenAI-compatible `/v1` inference surface is implemented in Phase 4. Stripe billing, webhooks, usage dashboards, and admin tooling remain later phases.
+- Auth and API-key management are implemented in Phase 2; the credit ledger and dashboard credit reads are implemented in Phase 3; the OpenAI-compatible `/v1` inference surface is implemented in Phase 4; Stripe Checkout and signature-verified, worker-granted webhooks are implemented in Phase 5. Usage dashboards, admin tooling, and receipt email remain later phases.
 
 ## Versioning and deprecation
 

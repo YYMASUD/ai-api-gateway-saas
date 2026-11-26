@@ -1,6 +1,6 @@
 """Tests for the worker-local logging redaction processor."""
 
-from app.logging import redact_sensitive_fields
+from worker_app.logging import redact_sensitive_fields
 
 
 def test_redact_sensitive_fields() -> None:

@@ -9,15 +9,17 @@ Deployment assumptions:
 
 from typing import Literal
 
-from pydantic import Field, RedisDsn
+from pydantic import Field, RedisDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class WorkerSettings(BaseSettings):
     """Worker settings sourced from environment variables only.
 
-    REDIS_URL is required and must point at the private Redis endpoint. Non-secret
-    operational defaults below may be overridden with WORKER_-prefixed variables.
+    REDIS_URL is required and must point at the private Redis endpoint.
+    DATABASE_URL is required and must be an asyncpg PostgreSQL DSN. Neither
+    value has a secret default. Non-secret operational defaults below may be
+    overridden with WORKER_-prefixed variables.
     """
 
     model_config = SettingsConfigDict(
@@ -32,8 +34,21 @@ class WorkerSettings(BaseSettings):
         alias="REDIS_URL",
         description="Private Redis DSN injected by the deployment secret manager.",
     )
+    database_url: str = Field(
+        ...,
+        alias="DATABASE_URL",
+        min_length=1,
+        description="Async PostgreSQL DSN (postgresql+asyncpg://) for the shared ledger.",
+    )
     queue_name: str = Field(default="arq:queue", min_length=1)
     max_jobs: int = Field(default=16, ge=1)
     job_timeout_seconds: int = Field(default=300, ge=1)
     result_ttl_seconds: int = Field(default=3600, ge=1)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO")
+
+    @field_validator("database_url")
+    @classmethod
+    def _database_url_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("DATABASE_URL must not be blank")
+        return value

@@ -93,6 +93,22 @@ class UpstreamError(APIError):
     code = "upstream_error"
 
 
+class ServiceUnavailableError(APIError):
+    """A required external service (e.g. Stripe) is not configured or available."""
+
+    status_code = 503
+    error_type = "api_error"
+    code = "service_unavailable"
+
+
+class WebhookSignatureError(APIError):
+    """An inbound provider webhook failed signature verification."""
+
+    status_code = 400
+    error_type = "invalid_request_error"
+    code = "invalid_signature"
+
+
 class InsufficientCreditsError(APIError):
     """Available wallet credits cannot cover the requested reservation."""
 

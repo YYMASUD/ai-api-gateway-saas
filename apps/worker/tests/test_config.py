@@ -3,11 +3,12 @@
 import pytest
 from pydantic import ValidationError
 
-from app.config import WorkerSettings
+from worker_app.config import WorkerSettings
 
 
 def test_redis_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://worker:placeholder@db:5432/gateway")
 
     with pytest.raises(ValidationError):
         WorkerSettings()  # type: ignore[call-arg]
@@ -15,6 +16,7 @@ def test_redis_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_settings_parse_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REDIS_URL", "rediss://redis.internal:6380/2")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://worker:placeholder@db:5432/gateway")
     monkeypatch.setenv("WORKER_QUEUE_NAME", "private:jobs")
     monkeypatch.setenv("WORKER_MAX_JOBS", "4")
     monkeypatch.setenv("WORKER_JOB_TIMEOUT_SECONDS", "45")
@@ -24,6 +26,7 @@ def test_settings_parse_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = WorkerSettings()  # type: ignore[call-arg]
 
     assert str(settings.redis_url) == "rediss://redis.internal:6380/2"
+    assert settings.database_url == "postgresql+asyncpg://worker:placeholder@db:5432/gateway"
     assert settings.queue_name == "private:jobs"
     assert settings.max_jobs == 4
     assert settings.job_timeout_seconds == 45
@@ -33,6 +36,7 @@ def test_settings_parse_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_non_secret_overrides_are_validated(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REDIS_URL", "redis://redis.internal:6379/0")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://worker:placeholder@db:5432/gateway")
     monkeypatch.setenv("WORKER_MAX_JOBS", "0")
 
     with pytest.raises(ValidationError):

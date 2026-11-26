@@ -85,7 +85,12 @@ services:
       RESERVATION_TTL_SECONDS: ${RESERVATION_TTL_SECONDS:-900}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-      STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
+      STRIPE_PRICE_10: ${STRIPE_PRICE_10:-}
+      STRIPE_PRICE_50: ${STRIPE_PRICE_50:-}
+      STRIPE_PRICE_100: ${STRIPE_PRICE_100:-}
+      # Checkout redirect defaults point at the local dashboard; override in prod.
+      STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-http://localhost:3000/dashboard/billing?checkout=success}
+      STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-http://localhost:3000/dashboard/billing?checkout=cancelled}
       EMAIL_PROVIDER: ${EMAIL_PROVIDER:-}
       EMAIL_API_KEY: ${EMAIL_API_KEY:-}
       EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
@@ -121,12 +126,13 @@ services:
 
   worker:
     build:
-      context: ./apps/worker
-      dockerfile: Dockerfile
+      # Repo-root build: the worker image installs apps/api to reuse CreditService.
+      # The API keeps its `app` module; only the worker package is `worker_app`.
+      context: .
+      dockerfile: apps/worker/Dockerfile
     image: ai-api-gateway-saas/worker:local
     environment:
       REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
-      # Reserved for later phases; the worker skeleton does not read DATABASE_URL yet.
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       WORKER_QUEUE_NAME: ${WORKER_QUEUE_NAME:-arq:queue}
       WORKER_MAX_JOBS: ${WORKER_MAX_JOBS:-16}
@@ -137,7 +143,8 @@ services:
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-worker}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
-      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      # No STRIPE_* here: the worker grants credits from the DB, it never calls
+      # Stripe. Email vars are reserved for the Phase 6 receipt email.
       EMAIL_PROVIDER: ${EMAIL_PROVIDER:-}
       EMAIL_API_KEY: ${EMAIL_API_KEY:-}
     depends_on:

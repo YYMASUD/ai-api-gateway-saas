@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-The stack is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Phase 1 established the topology, health/readiness, and data layer; Phase 2 added email/password auth and API-key management; Phase 3 added the credit ledger service and dashboard credit reads; Phase 4 added the OpenAI-compatible `/v1` inference surface with API-key scopes, request size caps, rate limiting, and the reserve/settle/refund lifecycle. Later-phase tasks are marked TODO.
+The stack is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Phase 1 established the topology, health/readiness, and data layer; Phase 2 added email/password auth and API-key management; Phase 3 added the credit ledger service and dashboard credit reads; Phase 4 added the OpenAI-compatible `/v1` inference surface with API-key scopes, request size caps, rate limiting, and the reserve/settle/refund lifecycle; Phase 5 added Stripe Checkout and worker-executed webhook credit grants. Later-phase tasks are marked TODO.
 
 ## Start and stop
 
@@ -59,6 +59,14 @@ Expected Phase 4 behavior:
 - **A real inference call in local dev returns `502 upstream_error`** because LiteLLM `model_list` is empty (no provider configured). This is expected: the reservation is **fully refunded**, so no credits are consumed. The 502 confirms the reserve/refund lifecycle works.
 - Rate limiting is per key: `RATE_LIMIT_REQUESTS_PER_MINUTE` (default 60) sliding window plus `RATE_LIMIT_MAX_CONCURRENT` (default 8) in-flight cap; breaches return `429` with `Retry-After`. It fails open if Redis is down.
 - A 1-microcredit floor is reserved even for zero-priced models; settlement charges the true cost and releases the hold.
+
+Expected Phase 5 behavior (Stripe):
+
+- With all Stripe variables blank (the default from `.env.example`), `POST /billing/checkout` returns **`503 stripe_not_configured`** and `POST /webhooks/stripe` returns **`400 invalid_signature`**. This is the intended local-only default; no keys are invented.
+- With test-mode Stripe values configured, `POST /billing/checkout` (JWT) returns `201` with `checkout_url`, `session_id`, `amount_cents`, `credits`, and `microcredits`, and creates a `payments` row with `status = pending`. It grants **no** credits.
+- `POST /webhooks/stripe` has no JWT. A verified signature produces `200 {"status":"queued"}` (first delivery) or `200 {"status":"already_processed"}` (replay); a bad signature produces `400 {"code":"invalid_signature"}`. The handler never grants credits inline.
+- The private worker consumes `process_webhook`, calls `grant_purchase` with `idempotency_key = stripe:<session_id>`, sets `payments.status = "completed"`, and sets `webhook_events.processed_at`. Five deliveries → one grant.
+- **No receipt email is sent yet.** Email is deferred to Phase 6; do not treat a missing receipt as a failed payment.
 
 ## Common failures
 
@@ -144,6 +152,49 @@ SELECT
 | Open reservation stuck after `502`/`504` or a crash | Reservation was not settled/refunded before the process died | Verify `credit_reservations.status` and `expires_at`. After `RESERVATION_TTL_SECONDS` (default 900s), run the credit service's `release_expired` locally; held credits are freed with a zero-amount `refund` row. Never edit ledger rows by hand. |
 | Zero-priced model shows a reservation | 1-microcredit floor applies even when the estimate is 0 | Expected: the hold exercises the reservation lifecycle and is released at settlement (true cost 0). Check for a `released`/`settled` reservation, not a stranded `open` one. |
 
+## Stripe / webhook troubleshooting (Phase 5)
+
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| `POST /billing/checkout` returns `503 stripe_not_configured` | `STRIPE_SECRET_KEY` is blank (local default) | Fill a **test-mode** `sk_test_...` key in `.env` (local only) or inject it from the secrets manager. Checkout is deliberately disabled while blank; no credits are granted. |
+| `POST /billing/checkout` returns `422` | Unknown `pack_id`, malformed body, or a redirect URL that is neither HTTPS nor a local HTTP URL | Use `pack_10`/`pack_50`/`pack_100`; use HTTPS redirects (plain HTTP only on `localhost`/`127.0.0.1`/`::1`). |
+| `POST /billing/checkout` returns `502 upstream_error` | Stripe SDK call failed | Check `docker compose logs api` (only the exception **type** and payment ID are logged, never card data). Confirm the Price IDs `STRIPE_PRICE_10/50/100` exist in the test account. The payment row is marked `failed` — never grant credits manually. |
+| `POST /webhooks/stripe` returns `400 invalid_signature` | Wrong `STRIPE_WEBHOOK_SECRET`, missing/malformed `Stripe-Signature` header, or the body was re-serialized/proxy-rewritten before verification | Confirm the API and the Stripe endpoint use the **same** signing secret. Send the exact raw body Stripe signed (no reformatting). Rotate the endpoint secret in both places if it leaked. |
+| Webhook returns `200 {"status":"queued"}` but no credits appear | Worker did not complete `process_webhook`, or it failed | Check `docker compose logs --tail=200 worker`; query `webhook_events.error` and `webhook_events.attempts` for the event; verify `payments.status` became `completed` and `credits_granted > 0`. Confirm the worker has `DATABASE_URL`/`REDIS_URL` and is on the same `backend` network. Do not hand-edit credits. |
+| `webhook_events.processed_at` set but `payments.status` still `pending` | Worker partially failed or was interrupted after the ledger grant | Check the `credit_ledger` row with `idempotency_key = stripe:<session_id>` **before** retrying. If the grant exists, only reconcile the payment status; re-running the grant is a no-op but must not be duplicated. |
+| Duplicate grant symptoms: two `purchase` ledger rows for one Checkout session, or balance credited twice | Ledger idempotency key bypassed, or `webhook_events` rows were deleted to force a replay | Stop retries immediately. Check `credit_ledger` for all rows with the `stripe:<session_id>` idempotency key and the `payments`/`webhook_events` rows. Preserve evidence, then escalate for a compensating ledger entry — never delete ledger rows. |
+| Replay returned `200 {"status":"already_processed"}` but the first job failed | Event recorded but worker failed; replay alone will not requeue | See "Safely replay a failed event" below. Do **not** delete the `webhook_events` row. |
+| No receipt email after a successful top-up | Receipt email is deferred to Phase 6 | Expected. There is no email sent by Phase 5 code; check credits via `GET /dashboard/credits`, not your inbox. |
+
+### Query webhook/payment state (read-only)
+
+Replace `<event-id>` and `<session-id>` with the Stripe event/session IDs from the dashboard or `X-Request-ID` correlation.
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT stripe_event_id, type, processed_at, attempts, error, created_at
+  FROM webhook_events WHERE stripe_event_id = '<event-id>';
+"
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT id, user_id, amount_cents, credits_granted, status, stripe_session_id, created_at
+  FROM payments WHERE stripe_session_id = '<session-id>';
+"
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT id, type, amount_microcredits, idempotency_key, created_at
+  FROM credit_ledger WHERE idempotency_key = 'stripe:<session-id>';
+"
+```
+
+`error`/`attempts` come from the failed job; `processed_at IS NOT NULL` is the terminal success marker. A single `purchase` row for the session is correct.
+
+### Safely replay a failed event
+
+1. Confirm the grant did **not** happen: no `credit_ledger` row for `stripe:<session-id>`, `payments.status` is `pending`/`failed`, and `webhook_events.processed_at IS NULL`.
+2. Check the worker is healthy and connected to Postgres/Redis (`docker compose ps`, `docker compose logs worker`), then fix the underlying cause (e.g. DB outage or a bad migration).
+3. Replay from **Stripe** (Dashboard → event → "Send test webhook" / replay) with the same raw payload and signing secret, or re-enqueue `process_webhook(event_id)` using the existing `webhook_events.id` if the event is already recorded. Replays of an already-recorded event return `already_processed` and do **not** enqueue — enqueue the job explicitly instead.
+4. Verify afterwards: exactly one `purchase` ledger row with `idempotency_key = stripe:<session-id>`, `payments.status = 'completed'`, and `webhook_events.processed_at` set.
+5. **Never** delete `webhook_events` rows, clear `processed_at`, or remove ledger idempotency keys to force a re-grant. If the grant already exists, escalate for a compensating entry through the normal incident process.
+
 ## Data and persistence
 
 - Postgres data: named volume `postgres_data` at `/var/lib/postgresql/data`.
@@ -177,6 +228,7 @@ Notes:
 - Rotating `JWT_SECRET` invalidates existing dashboard JWTs; users must sign in again. Changing `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` affects only newly issued tokens.
 - Rotating `LITELLM_MASTER_KEY` requires updating both API and LiteLLM env values and restarting both.
 - Rotating `POSTGRES_PASSWORD`/`REDIS_PASSWORD` requires updating the DSNs too (`DATABASE_URL`, `REDIS_URL`).
+- Rotating `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET`: update the API environment and the matching Stripe endpoint (webhook signing secret), then restart `api`; worker does not receive Stripe keys. Preserve `STRIPE_PRICE_*`/redirect config and verify that replay attempts with the old secret return `400`.
 
 If any secret may have leaked, rotate immediately and preserve evidence before deleting logs.
 
@@ -201,7 +253,7 @@ Production on-call ownership, paging, and severity definitions are TODO.
 - Managed database/Redis failover and restore procedures
 - Deployment rollback procedure and health-gated rollout
 - LiteLLM provider outage/fallback operations and model disablement
-- Stripe webhook replay/reconciliation procedure
+- Stripe webhook replay/reconciliation procedure (Phase 5 local procedure is documented above; production alerting and on-call ownership are TODO)
 - Production rate-limit/quota tuning and incident playbook (Phase 4 limits exist locally; production tiers need product sign-off)
 - Alert routing, SLOs, and dashboards
 - Password reset / email verification recovery procedures

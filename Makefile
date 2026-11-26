@@ -40,7 +40,7 @@ test-web:
 	cd apps/web && npm test
 
 test-worker:
-	cd apps/worker && python -m pytest
+	cd apps/worker && pip install -e ../api && python -m pytest
 
 lint: lint-api lint-web lint-worker
 
@@ -62,7 +62,7 @@ typecheck-web:
 	cd apps/web && npm run typecheck
 
 typecheck-worker:
-	cd apps/worker && mypy app
+	cd apps/worker && mypy worker_app
 
 migrate:
 	$(COMPOSE) run --rm api alembic upgrade head

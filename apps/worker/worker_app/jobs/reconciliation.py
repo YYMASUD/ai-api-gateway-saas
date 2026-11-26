@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from app.jobs.common import JobResult
+from worker_app.jobs.common import JobResult
 
 
 async def reconciliation(ctx: dict[str, Any], *, run_id: str | None = None) -> JobResult:
