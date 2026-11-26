@@ -15,7 +15,17 @@ from app.core.logging import configure_logging, get_logger
 from app.core.middleware import DashboardCORSMiddleware, RequestIDMiddleware
 from app.db.redis import create_redis_client
 from app.db.session import database_state
-from app.routers import admin, auth, billing, dashboard, health, v1_chat, v1_models, webhooks
+from app.routers import (
+    admin,
+    auth,
+    billing,
+    credits,
+    dashboard,
+    health,
+    v1_chat,
+    v1_models,
+    webhooks,
+)
 
 logger = get_logger(__name__)
 
@@ -77,6 +87,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(billing.router, prefix="/billing")
     app.include_router(webhooks.router, prefix="/webhooks")
     app.include_router(admin.router, prefix="/admin")
+    app.include_router(credits.router, prefix="/dashboard/credits")
 
     return app
 

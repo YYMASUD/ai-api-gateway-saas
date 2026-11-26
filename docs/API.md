@@ -6,6 +6,7 @@ This document describes the FastAPI gateway's HTTP surface.
 
 - **Phase 1** implements health/readiness probes and the OpenAI-compatible error envelope.
 - **Phase 2** implements self-built email/password authentication (`/auth/*`) and API-key lifecycle management (`/dashboard/keys*`); `/auth/me` and `/dashboard/keys*` are protected by HS256 JWTs, while `/auth/register` and `/auth/login` are public.
+- **Phase 3** implements owner-only credit reads (`/dashboard/credits*`) and the internal credit ledger/reservation service (reserve, settle, refund, release_expired, grant_purchase); dashboard reads are protected by HS256 JWTs.
 - **Later phases** add inference (`/v1/*`), billing/webhooks (`/billing/*`, `/webhooks/*`), usage data, and admin tooling. These are documented as *planned* and are not implemented yet.
 
 ## Base URLs
@@ -31,6 +32,7 @@ Every response includes an `X-Request-ID` header. If the request carried a sanit
 | `/auth/register`, `/auth/login` | none (public) | 2 (implemented) |
 | `/auth/me` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 2 (implemented) |
 | `/dashboard/keys*` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 2 (implemented) |
+| `/dashboard/credits`, `/dashboard/credits/ledger` | `Authorization: Bearer <jwt>` (HS256, `exp`/`iss`/`aud` required) | 3 (implemented) |
 | `/v1/*` | `Authorization: Bearer <api_key>` (SHA-256+pepper verified against `api_keys.key_hash`) | later (planned) |
 | `/billing/*`, `/webhooks/*`, `/admin/*` | API key or JWT as appropriate; webhook signature verification | later (planned) |
 
@@ -55,10 +57,12 @@ All errors follow the OpenAI-compatible shape, regardless of the route:
 | --- | --- | --- |
 | 400 | `invalid_request_error` | (varies) |
 | 401 | `authentication_error` | `invalid_api_key` / `invalid_credentials` / `invalid_token` |
+| 402 | `invalid_request_error` | `insufficient_credits` / `monthly_spend_cap_exceeded` (credit-service reserve checks) |
 | 403 | `permission_error` | `forbidden` / `user_suspended` (`insufficient_scope` arrives with /v1 scope enforcement) |
 | 404 | `invalid_request_error` | `not_found` |
 | 405 | `invalid_request_error` | `method_not_allowed` |
-| 409 | `invalid_request_error` | `email_exists` (email already registered) |
+| 409 | `invalid_request_error` | `email_exists` (email already registered) / `idempotency_conflict` (reused idempotency key with different parameters) |
+| 410 | `invalid_request_error` | `reservation_expired` (reservation passed `expires_at`) |
 | 422 | `invalid_request_error` | `invalid_request` (with `param` location) |
 | 429 | `rate_limit_error` | `rate_limit_exceeded` |
 | 502 | `api_error` | `upstream_error` |
@@ -333,6 +337,98 @@ Revoke an API key.
 
 **Audit log:** Key revocation is recorded in `audit_logs` with actor, action (`api_key.revoke`), and resource ID.
 
+## Implemented endpoints (Phase 3)
+
+Phase 3 adds the credit ledger service and owner-only dashboard credit reads. All amounts are integer **microcredits** (`1,000,000 microcredits = 1 credit`); no floating-point values are stored or returned.
+
+Accounting model:
+
+- `balance` = sum of the user's `credit_ledger` movements (append-only source of truth).
+- `reserved` = sum of `amount_microcredits` over the user's **open** `credit_reservations`.
+- `available` = `balance - reserved`; new reservations draw against `available`.
+
+### Dashboard credits
+
+All `/dashboard/credits*` endpoints require `Authorization: Bearer <jwt>` and are **owner-only**: they return data for the JWT's `sub` only. There is no parameter to query another user's credits (admin tooling is a later phase).
+
+#### `GET /dashboard/credits`
+
+Return the authenticated user's credit balance summary.
+
+**Headers:** `Authorization: Bearer <jwt>`
+
+**Response (200):**
+
+```json
+{
+  "balance_microcredits": 5000000,
+  "reserved_microcredits": 250000,
+  "available_microcredits": 4750000,
+  "lifetime_purchased_microcredits": 5000000,
+  "lifetime_spent_microcredits": 0
+}
+```
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Balance summary returned |
+| 401 | Missing or invalid JWT |
+| 403 | The authenticated account is suspended (`user_suspended`) |
+
+#### `GET /dashboard/credits/ledger`
+
+List the authenticated user's ledger entries, newest first. The ledger is **append-only**: entries are never updated or deleted (enforced by a database trigger), so a given entry ID always returns the same content. Corrections appear as new compensating entries.
+
+**Headers:** `Authorization: Bearer <jwt>`
+
+**Query parameters (pagination):**
+
+| Parameter | Type | Default | Constraints |
+| --- | --- | --- | --- |
+| `limit` | integer | 50 | 1–100 |
+| `cursor` | string (ledger entry UUID) | none | Keyset cursor: pass the previous page's `next_cursor`. Unknown or foreign cursors are ignored and the first page is returned. |
+
+**Response (200):**
+
+```json
+{
+  "items": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440002",
+      "type": "settlement",
+      "amount_microcredits": -1200,
+      "reference_id": "req_01J...",
+      "metadata": { "reservation_id": "550e8400-e29b-41d4-a716-446655440003" },
+      "created_at": "2026-11-26T14:22:10Z"
+    }
+  ],
+  "next_cursor": "550e8400-e29b-41d4-a716-446655440002"
+}
+```
+
+`type` is one of `purchase`, `reservation`, `settlement`, `refund`, `adjustment`. `amount_microcredits` is signed: positive credits the account, negative debits it; `reservation` and `refund` rows carry `0` because the hold itself lives in `credit_reservations`. Entries are ordered newest first (`created_at` descending, then `id` descending). Pass `next_cursor` as `cursor` to fetch the next page; `next_cursor` is `null` on the last page.
+
+**Status codes:**
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Page of ledger entries returned (may be empty) |
+| 401 | Missing or invalid JWT |
+| 403 | The authenticated account is suspended (`user_suspended`) |
+| 422 | Validation error (`limit` out of range) |
+
+### Credit service semantics (internal)
+
+The credit service provides `reserve`, `settle`, `refund`, `release_expired`, and `grant_purchase` operations. They are service-layer operations in Phase 3 (no public HTTP routes yet; `/v1` inference wiring arrives in a later phase) and share these guarantees:
+
+- **Idempotency:** every operation takes an idempotency key. Retries with the same key and parameters return the original outcome; reusing a key with different parameters is a `409 idempotency_conflict`.
+- **Row locking:** transactions lock rows with `SELECT ... FOR UPDATE` in a fixed order — `users` → `credit_balances` → `credit_reservations` — to avoid deadlocks.
+- **Reservation lifecycle:** `reserve` inserts an `open` reservation (unique per `request_id`, default expiry **15 minutes**) plus a zero-amount `reservation` ledger row; only `reserved` increases. `settle` closes it as `settled`, releases the whole hold, and debits the actual cost (`cost_microcredits ≤ amount_microcredits`) via a negative `settlement` ledger row; the unused difference becomes available again. `refund` and `release_expired` close it as `released`, freeing the hold with a zero-amount `refund` ledger row — `balance` is unchanged. `grant_purchase` credits a positive `purchase` entry to the ledger.
+- **Reserve checks:** insufficient available credits → `402 insufficient_credits`; exceeding `users.spend_cap_monthly_microcredits` for the current UTC calendar month → `402 monthly_spend_cap_exceeded` (0 disables the cap).
+- **Expiry:** settling a reservation past `expires_at` returns `410 reservation_expired`; unknown or foreign reservations return `404 not_found` (existence is not revealed).
+
 ## Planned endpoints (later phases)
 
 These routes are not registered yet and currently return `404 not_found`; their routers exist as empty placeholders. They are listed here so clients can be shaped against a stable contract.
@@ -349,9 +445,9 @@ These routes are not registered yet and currently return `404 not_found`; their 
 | Method | Path | Phase | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/dashboard/usage` | later | Per-key, per-day, per-model aggregates |
-| `GET` | `/dashboard/billing` | later | Credit balance, plan, upcoming invoice |
+| `GET` | `/dashboard/billing` | later | Plan and upcoming invoice; the credit balance itself is already served by `GET /dashboard/credits` (Phase 3) |
 
-> **Note:** Authentication (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`) and API-key lifecycle (`GET/POST/DELETE /dashboard/keys*`) are implemented in Phase 2. See the "Implemented endpoints (Phase 2)" section above.
+> **Note:** Authentication (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`) and API-key lifecycle (`GET/POST/DELETE /dashboard/keys*`) are implemented in Phase 2. The credit ledger and owner-only dashboard credit reads (`GET /dashboard/credits`, `GET /dashboard/credits/ledger`) are implemented in Phase 3. See the "Implemented endpoints" sections above.
 
 ### Billing and webhooks
 
@@ -385,8 +481,8 @@ Because the browser currently sends the JWT as a Bearer header (see the interim 
 
 - The `/v1` surface is intended to be OpenAI-compatible for request/response shapes and error codes. Streaming (`stream: true`) and advanced features (function calling, responses API) are later phases.
 - Money is represented as integer **microcredits** (`1,000,000 microcredits = 1 credit`). No floating-point currency values are stored or returned.
-- Rate limiting, quota enforcement, and per-key spend caps are not enforced yet.
-- Auth and API-key management are implemented in Phase 2; inference (`/v1/*`), billing, webhooks, usage data, and admin tooling remain later phases.
+- Rate limiting and inference-side quota enforcement are not enforced yet; the Phase 3 credit service enforces available-credit and monthly-cap checks on reserve, and exposes owner-only dashboard credit reads (`GET /dashboard/credits`, `GET /dashboard/credits/ledger`).
+- Auth and API-key management are implemented in Phase 2; the credit ledger and dashboard credit reads are implemented in Phase 3. Inference (`/v1/*`), Stripe billing, webhooks, usage data, and admin tooling remain later phases.
 
 ## Versioning and deprecation
 

@@ -6,8 +6,9 @@ This document describes the current security posture and the controls required b
 
 - **Phase 1** focuses on secret isolation, network boundaries, request tracing, redacted logging, and CI checks.
 - **Phase 2** adds self-built email/password authentication (Argon2id) and API-key lifecycle management in FastAPI.
+- **Phase 3** adds the credit ledger service (row-locked, idempotent reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads.
 
-Rate limiting, billing enforcement, and production monitoring remain planned/later-phase work. The dashboard's interim client-side token handling (see [Interim dashboard token handling](#interim-dashboard-token-handling-sessionstorage)) is **not** production-acceptable and must be migrated.
+Rate limiting, inference-side billing enforcement (`/v1` wiring), and production monitoring remain planned/later-phase work; the Phase 3 credit service already enforces balance and monthly-cap checks on reserve. The dashboard's interim client-side token handling (see [Interim dashboard token handling](#interim-dashboard-token-handling-sessionstorage)) is **not** production-acceptable and must be migrated.
 
 ## Assets and threat model
 
@@ -84,6 +85,20 @@ openssl rand -hex 24   # POSTGRES_PASSWORD / REDIS_PASSWORD
 - Key **create** and **revoke** actions write to `audit_logs` with actor, action, target type/ID, IP, and request context. The raw key, its hash, JWTs, and passwords are never written to audit or application logs.
 - The logging processor redacts `authorization`, `password`, `api_key`, `token`, `key_hash`, and similar fields, and masks known token formats (including `sk_live_...`).
 
+## Credit ledger integrity (Phase 3)
+
+The credit service (`reserve`, `settle`, `refund`, `release_expired`, `grant_purchase`) protects balances against double-spend, lost updates, and tampering:
+
+- **Append-only ledger.** `credit_ledger` is the source of truth: `balance = sum(ledger)`, `reserved = sum(open reservations)`, `available = balance - reserved`. A `BEFORE UPDATE OR DELETE` trigger (`trg_credit_ledger_append_only`) raises on any mutation, so corrections are compensating entries, never edits.
+- **Integer-only money.** All credit values are signed `BIGINT` microcredits (`1,000,000 = 1 credit`); no floats or decimals are stored or returned. `credit_balances` has non-negative checks on `balance` and `reserved`; reservations check `amount > 0` and `0 ≤ cost ≤ amount`.
+- **Row locking.** Every operation locks rows with `SELECT ... FOR UPDATE` in a fixed order — `users` → `credit_balances` → `credit_reservations` — so concurrent operations on the same account serialize without deadlocks.
+- **Idempotency.** All operations carry an idempotency key, enforced by unique constraints (`credit_ledger.idempotency_key`, `credit_reservations.request_id`). Retries with the same key return the original outcome; reusing a key with different parameters is a `409` conflict.
+- **Monthly spend cap.** `users.spend_cap_monthly_microcredits` (BIGINT, default 0 = disabled) is enforced at reserve time against spend in the current **UTC calendar month**; exceeding it returns `402 monthly_spend_cap_exceeded`. Insufficient available credits returns `402 insufficient_credits`.
+- **Reservation expiry.** Reservations default to a **15-minute** expiry. Settling an expired reservation returns `410 reservation_expired`; `release_expired` frees stale holds so reserved credits cannot be stranded.
+- **Owner-only reads.** `GET /dashboard/credits` and `GET /dashboard/credits/ledger` require a valid JWT and only ever return the token subject's own data; foreign reservation IDs are indistinguishable from missing ones (`404`).
+
+Reconciliation (comparing ledger sums to materialised balances) is **read-only**. Rebuilding `credit_balances` by replaying the ledger is **admin-only tooling in a later phase**; until then, never hand-edit balances or ledger rows — use compensating operations and follow `docs/RUNBOOK.md`.
+
 ## Interim dashboard token handling (sessionStorage)
 
 The Phase 2 dashboard stores the Bearer JWT in **`sessionStorage`** (`apps/web/lib/auth-token.ts`) so client components can call `/auth/*` and `/dashboard/*` directly.
@@ -110,7 +125,7 @@ Required production migration:
 - Redis requires a password even on the private network. AOF persistence is enabled.
 - Postgres is initialized with data checksums.
 
-## Application controls implemented (Phase 1 and Phase 2)
+## Application controls implemented (Phases 1–3)
 
 - Pydantic settings read environment variables only; secret fields reject blank values.
 - Passwords are hashed with Argon2id; login returns generic invalid-credential `401` responses.

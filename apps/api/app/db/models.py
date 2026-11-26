@@ -102,6 +102,11 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     spend_cap_monthly_cents: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default=text("0")
     )
+    # Microcredits (BIGINT). 0 disables the monthly cap enforced at reserve time.
+    # Coexists with spend_cap_monthly_cents, which remains the fiat/Stripe value.
+    spend_cap_monthly_microcredits: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
     # Additive: needed to reconcile Stripe customers with local users.
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Additive: dashboard session telemetry.
@@ -165,7 +170,14 @@ class CreditLedger(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class CreditBalance(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Materialised balances; fully rebuildable by replaying ``credit_ledger``."""
+    """Materialised wallet; fully rebuildable by replaying ``credit_ledger``.
+
+    ``balance`` is the total unspent wallet and equals the sum of all ledger
+    amounts. ``reserved`` is the sum of open ``credit_reservations`` amounts,
+    so spendable funds are ``balance - reserved``. Reserving or releasing a
+    hold changes only ``reserved`` (and writes a zero-amount ledger row); only
+    settlement or a purchase/adjustment changes ``balance``.
+    """
 
     __tablename__ = "credit_balances"
     __table_args__ = (
@@ -177,10 +189,11 @@ class CreditBalance(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    # Microcredits (BIGINT).
+    # Microcredits (BIGINT): total unspent wallet = sum(credit_ledger.amount).
     balance: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default=text("0")
     )
+    # Microcredits (BIGINT): held by open reservations; available = balance - reserved.
     reserved: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default=text("0")
     )
@@ -345,3 +358,47 @@ class ModelPricing(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     metadata_json: Mapped[dict] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+
+
+class CreditReservation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Outstanding credit holds (Phase 3).
+
+    ``credit_balances.balance`` stays the total unspent wallet (the ledger
+    sum); ``reserved`` is the sum of open reservation amounts and spendable
+    funds are ``balance - reserved``. Rows transition ``open`` → ``settled``
+    or ``released`` exactly once; the append-only ledger records the matching
+    movements via zero-amount reservation/refund rows.
+    """
+
+    __tablename__ = "credit_reservations"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_credit_reservations_request_id"),
+        CheckConstraint("status IN ('open', 'settled', 'released')", name="status_valid"),
+        CheckConstraint("amount_microcredits > 0", name="amount_positive"),
+        CheckConstraint(
+            "cost_microcredits >= 0 AND cost_microcredits <= amount_microcredits",
+            name="cost_valid",
+        ),
+        Index("ix_credit_reservations_status_expires_at", "status", "expires_at"),
+        Index("ix_credit_reservations_user_id_created_at", "user_id", "created_at"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    api_key_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True
+    )
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="open", server_default="open"
+    )
+    # Microcredits (BIGINT); the held amount is always positive.
+    amount_microcredits: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Microcredits (BIGINT) actually charged at settlement; 0 until settled.
+    cost_microcredits: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

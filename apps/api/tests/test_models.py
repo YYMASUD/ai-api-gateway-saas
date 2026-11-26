@@ -11,6 +11,7 @@ EXPECTED_TABLES = {
     "api_keys",
     "credit_ledger",
     "credit_balances",
+    "credit_reservations",
     "usage_events",
     "payments",
     "webhook_events",
@@ -28,6 +29,7 @@ REQUIRED_FIELDS: dict[str, set[str]] = {
         "role",
         "status",
         "spend_cap_monthly_cents",
+        "spend_cap_monthly_microcredits",
         "created_at",
         "updated_at",
     },
@@ -55,6 +57,20 @@ REQUIRED_FIELDS: dict[str, set[str]] = {
         "updated_at",
     },
     "credit_balances": {"id", "user_id", "balance", "reserved", "created_at", "updated_at"},
+    "credit_reservations": {
+        "id",
+        "user_id",
+        "api_key_id",
+        "request_id",
+        "status",
+        "amount_microcredits",
+        "cost_microcredits",
+        "expires_at",
+        "settled_at",
+        "released_at",
+        "created_at",
+        "updated_at",
+    },
     "usage_events": {
         "id",
         "user_id",
@@ -135,11 +151,14 @@ LEGACY_FIELDS = {
 
 MONEY_FIELDS = {
     ("users", "spend_cap_monthly_cents"),
+    ("users", "spend_cap_monthly_microcredits"),
     ("credit_ledger", "amount_microcredits"),
     ("credit_balances", "balance"),
     ("credit_balances", "reserved"),
     ("credit_balances", "lifetime_purchased_microcredits"),
     ("credit_balances", "lifetime_spent_microcredits"),
+    ("credit_reservations", "amount_microcredits"),
+    ("credit_reservations", "cost_microcredits"),
     ("usage_events", "cost_microcredits"),
     ("payments", "amount_cents"),
     ("payments", "credits_granted"),
@@ -206,6 +225,7 @@ def test_key_uniques_and_indexes() -> None:
     assert frozenset({"request_id"}) in _unique_constraint_columns("usage_events")
     assert frozenset({"model_id"}) in _unique_constraint_columns("model_pricing")
     assert frozenset({"user_id"}) in _unique_constraint_columns("credit_balances")
+    assert frozenset({"request_id"}) in _unique_constraint_columns("credit_reservations")
     assert frozenset({"idempotency_key"}) in _unique_constraint_columns("credit_ledger")
     assert frozenset({"stripe_session_id"}) in _unique_constraint_columns("payments")
     assert frozenset({"stripe_event_id"}) in _unique_constraint_columns("webhook_events")
@@ -214,3 +234,34 @@ def test_key_uniques_and_indexes() -> None:
 def test_api_key_prefix_is_eight_characters() -> None:
     prefix = models.Base.metadata.tables["api_keys"].c.prefix.type
     assert prefix.length == 8  # type: ignore[attr-defined]
+
+
+def test_credit_reservation_fields_and_constraints() -> None:
+    table = models.Base.metadata.tables["credit_reservations"]
+    assert table.c.request_id.type.length == 128
+    assert not table.c.request_id.nullable
+    assert table.c.status.type.length == 16
+    assert not table.c.status.nullable
+    assert table.c.status.server_default is not None
+    assert str(table.c.status.server_default.arg) == "open"
+    assert not table.c.amount_microcredits.nullable
+    assert not table.c.cost_microcredits.nullable
+    assert str(table.c.cost_microcredits.server_default.arg) == "0"
+    assert table.c.expires_at.type.timezone
+    assert not table.c.expires_at.nullable
+    assert table.c.settled_at.nullable
+    assert table.c.released_at.nullable
+    assert table.c.api_key_id.nullable
+    index_names = {index.name for index in table.indexes}
+    assert "ix_credit_reservations_status_expires_at" in index_names
+    assert "ix_credit_reservations_user_id_created_at" in index_names
+
+
+def test_users_microcredit_spend_cap_column() -> None:
+    cap = models.Base.metadata.tables["users"].c.spend_cap_monthly_microcredits
+    assert isinstance(cap.type, BigInteger)
+    assert not cap.nullable
+    assert str(cap.server_default.arg) == "0"
+    # The fiat cents column must be preserved alongside the new microcredit cap.
+    cents = models.Base.metadata.tables["users"].c.spend_cap_monthly_cents
+    assert isinstance(cents.type, BigInteger)

@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-Phase 1 establishes a local, production-shaped topology and security boundaries. Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Service code for health/readiness, configuration, persistence models, security helpers, structured logging, auth, and key management is implemented; inference routing, billing flows, and observability are later phases.
+Phase 1 establishes a local, production-shaped topology and security boundaries. Phase 2 adds self-built email/password authentication and API-key lifecycle management in FastAPI. Phase 3 adds the credit ledger service (reserve/settle/refund/release_expired/grant_purchase) and owner-only dashboard credit reads. Service code for health/readiness, configuration, persistence models, security helpers, structured logging, auth, key management, and the credit ledger is implemented; inference routing, Stripe billing flows, and observability are later phases.
 
 This document describes the intended architecture and marks which parts are actually implemented.
 
@@ -55,22 +55,23 @@ Rules enforced by configuration:
 
 1. Client sends an OpenAI-compatible request to `POST /v1/chat/completions` with a gateway API key.
 2. FastAPI authenticates the key by hashing `raw_key + API_KEY_PEPPER` with SHA-256 and looking up `api_keys.key_hash` (helpers and the 60s Redis lookup cache exist as of Phase 2; the `/v1` route wiring arrives in a later phase).
-3. FastAPI checks/reserves credits using the append-only `credit_ledger` and `credit_balances` tables. Money is integer **microcredits**: `1,000,000 microcredits = 1 credit`; no floats are stored.
+3. FastAPI checks/reserves credits using the append-only `credit_ledger`, the materialised `credit_balances`, and `credit_reservations`. Money is integer **microcredits**: `1,000,000 microcredits = 1 credit`; no floats are stored. A reserve opens a 15-minute reservation hold against `available = balance - reserved`, enforcing the per-user UTC-month spend cap; it writes no ledger row until settlement.
 4. FastAPI calls LiteLLM over the private network with the master key, forwarding only the model alias and sanitized request fields.
 5. LiteLLM selects a configured provider deployment and calls the upstream provider. Provider credentials never leave LiteLLM.
-6. FastAPI records a `usage_events` row (idempotent on `request_id`), settles the reservation, and returns an OpenAI-compatible response/error.
-7. Background workers roll up usage, settle credits, process webhook events, and send email.
+6. FastAPI records a `usage_events` row (idempotent on `request_id`), settles the reservation (closing it `settled`, debiting the actual cost, freeing the unused difference), and returns an OpenAI-compatible response/error. On failure the reservation is refunded/released rather than settled.
+7. Background workers roll up usage, settle credits, release expired reservations (`release_expired`), process webhook events, and send email.
 
-As of Phase 2, step 2 (key authentication primitives and caching) is implemented; steps 3–7 and the `/v1` route wiring remain contracts/TODOs. The implemented API surface is health/readiness plus authentication and API-key lifecycle (see `docs/API.md`).
+As of Phase 3, step 2 (key authentication primitives and caching) and the credit primitives behind step 3 (the credit service's reserve/settle/refund/release_expired/grant_purchase operations) are implemented; the `/v1` route wiring, usage ingestion, and worker job bodies remain contracts/TODOs. The implemented API surface is health/readiness, authentication, API-key lifecycle, and owner-only dashboard credit reads (see `docs/API.md`).
 
-## Data model (Phase 1 schema)
+## Data model (Phase 1–3 schema)
 
-The Phase 1/2 Alembic revisions create:
+The Phase 1/2/3 Alembic revisions (`0001_initial`, `0002_user_password_hash`, `0003_credit_reservations`) create:
 
-- `users`: accounts, status, role, optional password hash (added by the `0002_user_password_hash` revision), Stripe customer id.
+- `users`: accounts, status, role, optional password hash (added by the `0002_user_password_hash` revision), Stripe customer id, and `spend_cap_monthly_microcredits` (BIGINT, default 0 = disabled; added by `0003_credit_reservations`, enforced per user at reserve time over the UTC calendar month).
 - `api_keys`: name, prefix, `key_hash`, scopes, revoked/last-used timestamps. Raw keys are never stored.
-- `credit_ledger`: append-only movements with a signed `amount_microcredits`, a typed `type`, reference, and unique idempotency key.
-- `credit_balances`: available/reserved/lifetime counters with non-negative checks.
+- `credit_ledger`: append-only movements with a signed `amount_microcredits`, a typed `type`, reference, and unique idempotency key. A database trigger forbids UPDATE/DELETE.
+- `credit_balances`: materialised balance/reserved/lifetime counters with non-negative checks, fully rebuildable by replaying `credit_ledger`. `balance` excludes open holds: `available = balance - reserved`.
+- `credit_reservations` (Phase 3): outstanding credit holds — `id`, `user_id`, `api_key_id`, unique `request_id`, `status` (`open`/`settled`/`released`), `amount_microcredits` (> 0), `cost_microcredits` (0 ≤ cost ≤ amount), `expires_at` (default 15 minutes), `settled_at`, `released_at`, `created_at`, `updated_at`. Indexed on `(status, expires_at)` for expiry sweeps and `(user_id, created_at)` for history.
 - `usage_events`: per-request user/key/model/token/cost/latency/status with a unique `request_id`.
 - `payments`: provider payment/checkout references and amounts.
 - `webhook_events`: provider event id, payload, status, attempts, and errors.
@@ -122,6 +123,16 @@ Terraform will own networking, managed data services, runtime services, IAM, rem
 - API keys are `sk_live_` + 32 random bytes; only `SHA-256(raw_key + API_KEY_PEPPER)` and the 8-character prefix are stored.
 - Redis is the API-key lookup cache with a 60s TTL; revocation deletes the cache entry immediately (stale-but-bounded on failure).
 - The dashboard stores the JWT in `sessionStorage` as an interim Phase 2 measure; production must migrate to HttpOnly cookies behind a BFF.
+
+## Decisions in Phase 3
+
+- Credits are modelled as an append-only ledger plus a separate `credit_reservations` table rather than mutating balance directly: `balance = sum(ledger)`, `reserved = sum(open reservations)`, `available = balance - reserved`.
+- Reserve writes only a reservation (no ledger row); settle writes the settlement debit; refund writes a compensating entry; `release_expired` frees stale holds. This keeps the ledger immutable and auditable.
+- All credit operations are idempotent on a caller-supplied key (unique `credit_ledger.idempotency_key` / `credit_reservations.request_id`), so client retries cannot double-charge.
+- Transactions lock `users` → `credit_balances` → `credit_reservations` with `SELECT ... FOR UPDATE` in that fixed order to prevent deadlocks and lost updates.
+- Default reservation expiry is 15 minutes, swept by the worker's `release_expired`.
+- The monthly spend cap moved to `users.spend_cap_monthly_microcredits` (BIGINT, 0 = disabled) and is enforced on reserve over the UTC calendar month; `spend_cap_monthly_cents` remains the fiat/Stripe value.
+- Dashboard credit reads are owner-only (JWT `sub`); admin reconciliation/rebuild tooling is deferred to a later phase.
 
 ## Decisions in Phase 1
 

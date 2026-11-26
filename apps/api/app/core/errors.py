@@ -81,6 +81,39 @@ class UpstreamError(APIError):
     code = "upstream_error"
 
 
+class InsufficientCreditsError(APIError):
+    """Available wallet credits cannot cover the requested reservation."""
+
+    status_code = 402
+    code = "insufficient_credits"
+
+
+class MonthlySpendCapExceededError(APIError):
+    """The user's enabled monthly microcredit spend cap would be exceeded."""
+
+    status_code = 402
+    code = "monthly_spend_cap_exceeded"
+
+
+class IdempotencyConflictError(APIError):
+    """An idempotency key was replayed with a different fingerprint."""
+
+    status_code = 409
+    code = "idempotency_conflict"
+
+
+class ReservationNotFoundError(APIError):
+    status_code = 404
+    code = "reservation_not_found"
+
+
+class ReservationExpiredError(APIError):
+    """An open reservation expired before settlement; it must be released."""
+
+    status_code = 410
+    code = "reservation_expired"
+
+
 def error_body(
     *,
     message: str,

@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-The stack is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Phase 1 established the topology, health/readiness, and data layer; Phase 2 added email/password auth and API-key management. Later-phase tasks are marked TODO.
+The stack is local-only. There is no production deployment, on-call rotation, or alert routing yet. This runbook covers local operations and the failure modes most likely while developing the stack. Phase 1 established the topology, health/readiness, and data layer; Phase 2 added email/password auth and API-key management; Phase 3 added the credit ledger service and dashboard credit reads. Later-phase tasks are marked TODO.
 
 ## Start and stop
 
@@ -46,6 +46,12 @@ Expected Phase 2 behavior:
 - `GET /dashboard/keys` returns a bare JSON array of key metadata (no plaintext keys). `POST /dashboard/keys` returns the key exactly once in `CreatedApiKey.key`; `DELETE /dashboard/keys/{id}` returns 204 and invalidates the Redis cache entry.
 - JWT `expires_in` equals `JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60` (default 3600s). The web UI stores the token in `sessionStorage` (interim; see SECURITY.md).
 
+Expected Phase 3 behavior:
+
+- `GET /dashboard/credits` returns 200 with `balance_microcredits`, `reserved_microcredits`, and `available_microcredits` for the JWT's owner (`available = balance - reserved`).
+- `GET /dashboard/credits/ledger` returns 200 with a keyset-paginated envelope (`items`, `next_cursor`), newest first; pass `next_cursor` as `cursor` for the next page. Entries are append-only and never change.
+- The credit service (reserve/settle/refund/release_expired/grant_purchase) is idempotent per key, locks rows in the order users → credit_balances → credit_reservations, and enforces the per-user UTC-month spend cap on reserve. Reservations expire after 15 minutes by default.
+
 ## Common failures
 
 | Symptom | Cause | Action |
@@ -80,6 +86,36 @@ Expected Phase 2 behavior:
 
 - **401 Unauthorized** — the request has no valid credentials (missing/expired/malformed JWT, login failure, invalid/revoked API key). Re-authenticate.
 - **403 Forbidden** — credentials are valid but the account is suspended on an authenticated route (`user_suspended`). Do not retry with the same token.
+
+## Phase 3 credit troubleshooting
+
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| Reserve fails with `402 insufficient_credits` | `available = balance - reserved` is below the requested amount | Check `GET /dashboard/credits`. Open reservations hold credits until settled or released (15-minute default expiry). Top up via `grant_purchase` (local testing) or wait for holds to clear. Do not hand-edit balances. |
+| Reserve fails with `402 monthly_spend_cap_exceeded` | Spend in the current UTC calendar month would exceed `users.spend_cap_monthly_microcredits` | `0` disables the cap. The window resets at the UTC month boundary, not local time. For local testing, adjust the per-user column deliberately; never bypass the check in code. |
+| Settle/refund returns `404 not_found` | Reservation unknown, or it belongs to another user (existence is deliberately not revealed) | Use the owning account and the exact `request_id` used at reserve time. Do not weaken the 404 behavior. |
+| Settle returns `410 reservation_expired` | The reservation passed `expires_at` (default 15 minutes) and can no longer be settled | The hold is freed via `release_expired`. Re-reserve with a new `request_id` if the work must be retried; do not extend or edit the old reservation. |
+| Operation returns `409 idempotency_conflict` | An idempotency key was reused with different parameters | Retries must repeat the original key **and** parameters to get the original outcome; new work needs a new key. Never delete ledger rows to "fix" a conflict. |
+| Open reservations pile up past `expires_at` | The worker `expire_reservations` job body is still a stub | Invoke the credit service's `release_expired` operation (service layer) in local testing; reserved credits are freed only when it runs. Worker scheduling is later-phase wiring. |
+
+### Ledger vs balance consistency
+
+`credit_balances` is materialised and must equal the append-only ledger; `reserved` must equal the sum of open reservations. Read-only check for one user (replace `<user-uuid>`):
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT
+  (SELECT COALESCE(SUM(amount_microcredits), 0) FROM credit_ledger
+    WHERE user_id = '<user-uuid>') AS ledger_balance,
+  (SELECT balance FROM credit_balances WHERE user_id = '<user-uuid>') AS balance_row,
+  (SELECT COALESCE(SUM(amount_microcredits), 0) FROM credit_reservations
+    WHERE user_id = '<user-uuid>' AND status = 'open') AS open_reserved,
+  (SELECT reserved FROM credit_balances WHERE user_id = '<user-uuid>') AS reserved_row;
+"
+```
+
+- `ledger_balance` must equal `balance_row`, and `open_reserved` must equal `reserved_row`. Re-run outside busy traffic: in-flight transactions can show a transient difference.
+- A persistent mismatch is an incident: preserve logs/evidence and follow the incident-response steps below. The ledger is append-only (a trigger rejects UPDATE/DELETE) — never edit ledger rows or balances by hand. Reconciliation is read-only; an admin-only rebuild (replaying the ledger into `credit_balances`) is a later-phase tool.
 
 ## Data and persistence
 
